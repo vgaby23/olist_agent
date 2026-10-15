@@ -1,0 +1,4 @@
+dotenv
+qdrant_client
+streamlit
+sqlalchemy
