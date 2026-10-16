@@ -2,3 +2,5 @@ dotenv
 qdrant_client
 streamlit
 sqlalchemy
+langgraph-supervisor
+langchain-openai
