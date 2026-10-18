@@ -83,7 +83,14 @@ for folder in (THIS_FOLDER, THIS_FOLDER.parent / "Data_Preprocessing" / "Vector_
     if str(folder) not in sys.path:
         sys.path.append(str(folder))
 
-import rag_core  # noqa: E402  (this import has to come after the lines above)
+# Two ways to search (the only difference between running on your laptop and running in the cloud):
+#   RAG_API_URL not set -> import rag_core and search Qdrant directly (needs qdrant-client, OPENAI_API_KEY...)
+#   RAG_API_URL set     -> send a POST /retrieve to the RAG API (the container); no Qdrant code is needed here
+RAG_API_URL = os.environ.get("RAG_API_URL", "").strip()
+if RAG_API_URL:
+    rag_core = None
+else:
+    from Data_Preprocessing.Vector_Data import rag_core  # noqa: E402  (this import has to come after the lines above)
 
 
 # Words that tell the three languages of this project apart. Words that exist in two of them
@@ -163,11 +170,22 @@ def explain_error(error):
 def retrieve(query, top_k, filters):
     """The ONE place where this agent talks to the search code.
 
-    Today it calls rag_core directly. When the RAG service runs as its own API (Docker / Cloud Run),
-    only this function changes: it will send a POST /retrieve request instead.
+    - RAG_API_URL set (Docker / Cloud Run): sends a POST /retrieve request to the RAG API.
+    - RAG_API_URL not set: calls rag_core directly (handy on your laptop).
     Returns a list of {"content", "relevance_score", "metadata"}.
     """
+    if RAG_API_URL:
+        import agent_client                       # the small HTTP client for the API
+        return agent_client.retrieve(query, top_k=top_k, filters=filters, base_url=RAG_API_URL)
     return rag_core.search(query, top_k=top_k, filters=filters)
+
+
+def filter_errors():
+    """The exceptions that mean "the filters were wrong" (they depend on the search mode)."""
+    if RAG_API_URL:
+        import agent_client
+        return (agent_client.FilterRejected,)
+    return (rag_core.FilterError,)
 
 
 def find_categories():
@@ -285,7 +303,7 @@ def search_reviews(
     #    so the LLM can read it and try again (or tell the user).
     try:
         results = retrieve(query, fetch, filters)
-    except rag_core.FilterError as error:
+    except filter_errors() as error:
         return f"The filters were not valid: {error}"
     except Exception as error:
         return f"The review search failed: {type(error).__name__}: {str(error)[:200]}"
