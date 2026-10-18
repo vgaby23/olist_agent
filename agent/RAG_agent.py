@@ -77,6 +77,7 @@ LLM_MODEL = os.environ.get("LLM_MODEL", "gpt-4o-mini")      # the OpenAI chat mo
 #   nonsense / near-miss, Portuguese   up to 0.56        nonsense, English              up to 0.41
 # No single number separates them, so: below MIN_MATCH a review is dropped, below WEAK_MATCH it is
 # marked "(weak)" and the LLM must read it carefully. The agent is told to search in Portuguese.
+MAX_ORDER_IDS = 50                                          # most order_ids accepted in one search
 SEARCH_POOL = 50                                            # how many reviews are checked when must_contain is used
 MIN_MATCH = float(os.environ.get("MIN_MATCH", "0.45"))      # below this a review is dropped (0 = keep everything)
 WEAK_MATCH = float(os.environ.get("WEAK_MATCH", "0.60"))    # below this a review is marked "(weak)"
@@ -197,6 +198,7 @@ def search_reviews(
     product_id: str | None = None,
     seller_city: str | None = None,
     order_id: str | None = None,
+    order_ids: list[str] | None = None,
     min_price: float | None = None,
     max_price: float | None = None,
     must_contain: str | None = None,
@@ -218,6 +220,7 @@ def search_reviews(
         product_category: only reviews of orders that contain this ENGLISH category, e.g. "health_beauty".
         seller_city: only reviews of orders from sellers in this city, e.g. "sao paulo".
         order_id: the review of ONE specific order (the long id). Use it with a general query like "avaliação".
+        order_ids: the reviews of SEVERAL orders (up to 50 long ids, e.g. the order_ids the data agent found for a month). Use it with a general query like "avaliação", or a topic like "atraso na entrega".
         seller_id: only reviews of orders from ONE seller (the long seller id, copied exactly). Use it when the question is about a specific seller or shop. With no other topic, use a general query like "reclamação".
         product_id: only reviews of orders that contain ONE specific product (the long product id, copied exactly).
         min_price: only orders with an item that costs at least this many Brazilian reais (BRL).
@@ -247,6 +250,13 @@ def search_reviews(
         filters["seller_id"] = seller_id.strip()
     if product_id:
         filters["product_id"] = product_id.strip()
+    if order_ids:
+        ids = list(dict.fromkeys(i.strip() for i in order_ids if i and i.strip()))   # no blanks, no duplicates
+        if len(ids) > MAX_ORDER_IDS:
+            return (f"Too many order_ids ({len(ids)}). Send at most {MAX_ORDER_IDS}, or ask the user to narrow "
+                    f"the question down (seller, category, rating).")
+        if ids:
+            filters["order_id"] = ids                 # a list = "any of these orders" (rag_core uses MatchAny)
 
     price_range = {}
     if min_price is not None:
@@ -283,7 +293,7 @@ def search_reviews(
     # even for a nonsense question, so without this the LLM would see unrelated reviews and might list them.
     best_score = max(hit["relevance_score"] for hit in results)
      # The score means nothing when we look up one order, or when the filters are the topic (general query).
-    use_score = not order_id and not is_general_query(query)
+    use_score = not order_id and not order_ids and not is_general_query(query)
     if use_score:
         results = [hit for hit in results if hit["relevance_score"] >= MIN_MATCH]
     if not results:
@@ -399,6 +409,7 @@ HOW TO WORK
 - Price: "expensive", "cheap" or an amount -> min_price / max_price (Brazilian reais). Pick a sensible limit
   (e.g. min_price=150 for "expensive", max_price=50 for "cheap") and tell the user which limit you used.
 - A specific order -> order_id, with the general query "avaliação". The search cannot find an order any other way.
+- TWO OR MORE orders (a list of order_ids, e.g. found by the data agent for a month) -> order_ids, ONE search with all of them (up to 50). Do not search them one by one.
 - A specific seller -> seller_id; a specific product -> product_id (copy the long id exactly). If the question has no other topic, use a general query: "reclamação" for low ratings, "elogio" for high ratings.
 - If the first search is not useful, try again with different words or fewer filters.
 - Reply with: 1) a short summary of the main themes, 2) two to four example quotes.
