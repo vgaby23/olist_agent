@@ -1,8 +1,10 @@
+dotenv
 fastapi
 httpx
 langchain
 langchain-core
 langchain-openai
+langgraph-supervisor
 langchain-text-splitters
 langchain-qdrant
 qdrant-client
@@ -14,4 +16,5 @@ pytest
 qdrant-client
 sentence-transformers
 streamlit
+sqlalchemy
 uvicorn
