@@ -1,12 +1,13 @@
 """
 test_sql_security.py - Tes OFFLINE (tanpa OpenAI) untuk sql_tools.py dan alur sql_agent.py.
 
-Menguji: validasi SQL, scope per role, authorizer, batas baris/waktu,
+Menguji: validasi SQL, scope per role, tool per sesi login, authorizer, batas baris/waktu,
 angka referensi fitur Seller P0, dan alur ask_sql_agent dengan LLM palsu.
 
 Jalankan dari folder utama proyek:
-    python -m agent.test_sql_security
+    python -m data_preprocessing.numeric_data.test_sql_security
 """
+import inspect
 from types import SimpleNamespace
 
 from data_preprocessing.numeric_data.sql_tools import get_monthly_revenue, make_scope, run_query, validate_query
@@ -140,7 +141,7 @@ check("most-loved categories (se-platform)", len(loved) == 3, loved.to_dict("rec
 
 # ---------------------------------------------------------------- 5. alur ask_sql_agent dengan LLM palsu
 try:
-    from agent.sql_agent import ask_sql_agent, period_note
+    from agent.sql_agent import ask_sql_agent, get_customer_categories, make_data_tools, period_note
 except ImportError as error:
     print(f"[SKIP] tes agent: {error}")
 else:
@@ -183,6 +184,36 @@ else:
     check("agent: ringkasan tanpa filter periode tidak mengklaim 2017-2018",
           "all available data" in summary and "January 2017 to August 2018 (the default" not in summary)
     check("agent: ringkasan meminta nama kota disalin persis", "EXACTLY" in summary)
+
+    # tool per sesi login: role & id dikunci, LLM hanya mengisi pertanyaan
+    def tool_name(t):
+        return getattr(t, "name", None) or t.__name__
+
+    def tool_args(t):
+        return set(t.args) if hasattr(t, "args") else set(inspect.signature(t).parameters)
+
+    def call(t, **kwargs):
+        return t.invoke(kwargs) if hasattr(t, "invoke") else t(**kwargs)
+
+    seller_tools = make_data_tools("seller", SELLER)
+    check("tool seller: hanya ask_data_agent", [tool_name(t) for t in seller_tools] == ["ask_data_agent"])
+    check("tool: argumen hanya 'question' (tidak ada role/user_id)", tool_args(seller_tools[0]) == {"question"})
+    check("tool: login seller tanpa id ditolak saat tool dibuat", raises(make_data_tools, "seller") is not None)
+
+    customer_tools = {tool_name(t): t for t in make_data_tools("customer", CUSTOMER)}
+    history = customer_tools.get("customer_past_categories")
+    check("tool customer: customer_past_categories tanpa argumen", history is not None and tool_args(history) == set())
+    text = call(history)
+    check("tool customer: riwayat kategori miliknya sendiri", text.startswith("This customer bought before"), text)
+    check("riwayat kategori: role selain customer ditolak",
+          raises(get_customer_categories, make_scope("seller", SELLER)) is not None)
+    check("riwayat kategori: hasil sama dengan query manual customer itu",
+          get_customer_categories(customer).category.tolist()
+          == run_query("SELECT p.product_category_name_english AS c, COUNT(*) n, MAX(o.order_purchase_timestamp) t "
+                       "FROM orders o JOIN order_items oi ON oi.order_id = o.order_id "
+                       "JOIN products p ON p.product_id = oi.product_id WHERE o.is_delivered = 1 "
+                       "AND p.product_category_name_english != 'uncategorized' GROUP BY c "
+                       "ORDER BY n DESC, t DESC LIMIT 3", customer).c.tolist())
 
 print(f"\n{sum(results)}/{len(results)} PASS")
 raise SystemExit(0 if all(results) else 1)

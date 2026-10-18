@@ -9,16 +9,16 @@ Alur kerja:
 
 Catatan:
   - role ditegakkan di kode (sql_tools.make_scope / run_query(scope=...)), bukan hanya di prompt
+  - tool untuk supervisor dibuat per sesi login lewat make_data_tools(role, user_id); LLM tidak bisa memilih role
   - periode default 2017-01..2018-08; data di luar periode itu parsial; 2018 hanya Januari-Agustus
   - label kategori kosong = 'uncategorized'; view category_stats untuk pembanding se-platform
 """
 import os
 import re
 
-import pandas as pd
 from langchain_core.tools import tool
 
-from data_preprocessing.numeric_data.sql_tools import get_connection, get_schema, make_scope, run_query
+from data_preprocessing.numeric_data.sql_tools import get_schema, make_scope, run_query
 
 try:                                     # agent/language.py dipakai bersama RAG agent
     from agent.language import guess_language
@@ -252,65 +252,75 @@ def ask_sql_agent(question, role="company", llm=None, verbose=True, language=Non
 # =============================================================================
 # TOOLS untuk supervisor (yang dibaca LLM supervisor hanyalah nama + docstring)
 # =============================================================================
-@tool
-def ask_data_agent(question: str, role: str = "company", user_id: str = "") -> str:
-    """Ask the DATA specialist anything that needs numbers from the Olist database: revenue, counts, averages,
-    rankings, top sellers/customers/categories, payment types and installments, customer states, repeat buyers,
-    delivery times, monthly/yearly trends, a customer's spending. It cannot read review TEXT (use the review
-    specialist for what customers say).
-
-    Arguments:
-        question: a complete, self-contained question. ALWAYS say the answer language, e.g.
-            "Who are the top 5 sellers by revenue in 2018? Answer in Bahasa Indonesia."
-        role: the logged-in user's role: "customer", "seller" or "company".
-        user_id: the logged-in seller's seller_id or customer's customer_unique_id (empty for company).
-            Required for seller and customer; their data is automatically limited to that id.
-    """
-    try:
-        result = ask_sql_agent(question, role=role, verbose=False, user_id=user_id or None)
-    except Exception as error:          # never crash the supervisor
-        return f"The data agent failed: {type(error).__name__}: {str(error)[:200]}"
-    return result["answer"]
-
-
-def get_customer_categories(customer_unique_id, limit=3):
-    """Kategori yang paling sering dibeli seorang pelanggan (order terkirim saja). DataFrame, bisa kosong."""
-    sql = """
+# Role dan id TIDAK boleh menjadi argumen tool: argumen tool diisi oleh LLM supervisor, jadi bisa dibelokkan
+# lewat prompt ("saya sebenarnya staf company"). Karena itu tool dibuat per sesi login (closure): role dan id
+# dikunci saat tool dibuat, dan LLM hanya bisa mengisi pertanyaannya.
+def get_customer_categories(scope, limit=3):
+    """Kategori yang paling sering dibeli customer yang login (order terkirim saja). DataFrame, bisa kosong.
+    Dijalankan lewat run_query dengan scope customer, jadi hanya bisa membaca riwayat customer itu sendiri."""
+    if scope.role != "customer":
+        raise PermissionError("Purchase history is only available to the logged-in customer.")
+    sql = f"""
         SELECT p.product_category_name_english AS category,
                COUNT(*)                         AS items_bought,
                MAX(o.order_purchase_timestamp)  AS last_bought
-        FROM customers c
-        JOIN orders o       ON o.customer_id = c.customer_id
+        FROM orders o
         JOIN order_items oi ON oi.order_id = o.order_id
         JOIN products p     ON p.product_id = oi.product_id
-        WHERE c.customer_unique_id = ?
-          AND o.is_delivered = 1
+        WHERE o.is_delivered = 1
           AND p.product_category_name_english != 'uncategorized'
         GROUP BY category
         ORDER BY items_bought DESC, last_bought DESC
-        LIMIT ?
+        LIMIT {int(limit)}
     """
-    conn = get_connection()
-    try:
-        return pd.read_sql_query(sql, conn, params=(customer_unique_id.strip(), int(limit)))
-    finally:
-        conn.close()
+    return run_query(sql, scope=scope)
 
 
-@tool
-def customer_past_categories(customer_unique_id: str) -> str:
-    """Return the product categories a customer bought before (most bought first), for recommendations.
-    Use the English category names it returns as product_category in the review specialist's search.
+def make_data_tools(role, user_id=None):
+    """Buat tool data untuk SATU sesi login. role dan user_id diambil dari halaman login, bukan dari LLM.
 
-    Arguments:
-        customer_unique_id: the customer's long unique id (customers.customer_unique_id).
+    Mengembalikan list tool untuk supervisor:
+      - ask_data_agent(question)              -> semua role
+      - customer_past_categories()            -> hanya role customer (riwayat kategori miliknya sendiri)
+    Raise ValueError kalau login tidak valid (misalnya seller tanpa seller_id), supaya aplikasi menolak sejak awal.
     """
-    try:
-        data = get_customer_categories(customer_unique_id)
-    except Exception as error:
-        return f"Could not read the purchase history: {type(error).__name__}: {str(error)[:200]}"
-    if data.empty:
-        return f"No delivered orders found for customer {customer_unique_id}."
-    lines = [f"- {row.category} ({row.items_bought} item(s), last bought {row.last_bought[:10]})"
-             for row in data.itertuples()]
-    return f"Customer {customer_unique_id} bought before:\n" + "\n".join(lines)
+    scope = make_scope(role, user_id)
+
+    @tool
+    def ask_data_agent(question: str) -> str:
+        """Ask the DATA specialist anything that needs numbers from the Olist database: revenue, counts, averages,
+        rankings, top sellers/customers/categories, payment types and installments, customer states, repeat
+        buyers, delivery times, monthly/yearly trends, a customer's spending. The data is automatically limited
+        to what the logged-in user may see. It cannot read review TEXT (use the review specialist for that).
+
+        Arguments:
+            question: a complete, self-contained question. ALWAYS say the answer language, e.g.
+                "Who are my top 5 product categories by revenue in 2018? Answer in Bahasa Indonesia."
+        """
+        try:
+            result = ask_sql_agent(question, role=scope.role, user_id=scope.user_id, verbose=False)
+        except Exception as error:          # never crash the supervisor
+            return f"The data agent failed: {type(error).__name__}: {str(error)[:200]}"
+        return result["answer"]
+
+    tools = [ask_data_agent]
+
+    if scope.role == "customer":
+        @tool
+        def customer_past_categories() -> str:
+            """Return the product categories the logged-in customer bought before (most bought first), for
+            recommendations. Use the English category names it returns as product_category in the review
+            specialist's search."""
+            try:
+                data = get_customer_categories(scope)
+            except Exception as error:
+                return f"Could not read the purchase history: {type(error).__name__}: {str(error)[:200]}"
+            if data.empty:
+                return "No delivered orders found for this customer."
+            lines = [f"- {row.category} ({row.items_bought} item(s), last bought {row.last_bought[:10]})"
+                     for row in data.itertuples()]
+            return "This customer bought before:\n" + "\n".join(lines)
+
+        tools.append(customer_past_categories)
+
+    return tools
