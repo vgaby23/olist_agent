@@ -26,6 +26,8 @@ HOW THE SUPERVISOR USES IT   (note for the teammate who builds the supervisor)
         into that language. Without a hint, the agent uses the language of the question you send it.
       * To get the review of ONE order (e.g. after the SQL agent found its order_id), put the order_id in the
         question: "What did order <order_id> say?". Price limits ("above 150 BRL") also work as filters.
+      * For a SELLER user, put their seller_id in the question: "Why do customers of seller <seller_id> give
+        low ratings?". The same works for one product: "What do reviews of product <product_id> say?".
       * The answer is plain text: a summary plus example quotes, each with its rating, product category, seller city
         and order_id.
         order_id links to the SQL tables, so the SQL agent can look up more about that order.
@@ -70,43 +72,29 @@ from langchain_openai import ChatOpenAI
 LLM_MODEL = os.environ.get("LLM_MODEL", "gpt-4o-mini")      # the OpenAI chat model used as the "brain"
 
 # The "match" score of a review is a cosine similarity: higher = closer to the question.
-# In the first real test run, relevant reviews scored 0.28 to 0.75 and a nonsense question
-# ("spaceship engines") scored 0.12 to 0.15. So:
+# Tuned on the full index (34,732 reviews) with test_folder/tune_thresholds.py:
+#   real topics, Portuguese query      0.63 to 0.92      real topics, English query     0.46 to 0.68
+#   nonsense / near-miss, Portuguese   up to 0.56        nonsense, English              up to 0.41
+# No single number separates them, so: below MIN_MATCH a review is dropped, below WEAK_MATCH it is
+# marked "(weak)" and the LLM must read it carefully. The agent is told to search in Portuguese.
 SEARCH_POOL = 50                                            # how many reviews are checked when must_contain is used
-MIN_MATCH = float(os.environ.get("MIN_MATCH", "0.20"))      # below this a review is dropped (0 = keep everything)
-WEAK_MATCH = float(os.environ.get("WEAK_MATCH", "0.35"))    # below this a review is marked "(weak)"
+MIN_MATCH = float(os.environ.get("MIN_MATCH", "0.45"))      # below this a review is dropped (0 = keep everything)
+WEAK_MATCH = float(os.environ.get("WEAK_MATCH", "0.60"))    # below this a review is marked "(weak)"
+
+# General queries used when the FILTERS are the topic ("low-rated health_beauty products").
+# They score low (0.25 to 0.55) even when every review fits, so the score cut-off is skipped for them.
+GENERAL_QUERIES = {"reclamação", "reclamacao", "elogio", "opinião sobre o produto", "opiniao sobre o produto",
+                   "avaliação", "avaliacao", "complaint", "complaints", "praise", "review", "reviews"}
+
+
+def is_general_query(query):
+    """True for the general words above, e.g. "Reclamação " -> True, "atraso na entrega" -> False."""
+    return query.strip().lower() in GENERAL_QUERIES
+
 THIS_FOLDER = Path(__file__).resolve().parent
 
-from data_preprocessing.vector_data import rag_core  
-
-
-# Words that tell the three languages of this project apart. Words that exist in two of them
-# ("a", "no", "do", "me", "para", "mau") are left out on purpose.
-LANGUAGE_WORDS = {
-    "English": set("the what which who how are is there any anyone about show find give did customers customer "
-                   "say said with from only most common overall average per your ignore instructions system "
-                   "prompt and or for of in to my they their received ordered mention specific complaints "
-                   "complain why when where does have has were was that".split()),
-    "Bahasa Indonesia": set("apakah apa yang yg dan untuk dengan dari ada gak tidak nggak ga bgt banget terkait "
-                            "produk rusak berikan tolong bagaimana kenapa mengapa pelanggan ulasan terburuk "
-                            "terbaik datengnya datangnya telat atau saja semua kasih bintang pengiriman barang "
-                            "kiriman bisa minta cari tampilkan ini itu di ke saya aku kamu".split()),
-    "Portuguese": set("quais qual quem onde como porque não nao uma uns umas elogios reclamações reclamacoes "
-                      "produtos qualidade clientes sobre dos das pelo pela com mais muito há existe algum "
-                      "alguma tem entrega pedido são sao é foi".split()),
-}
-
-
-def guess_language(text):
-    """"What do customers say?" -> "English". Returns None when it is not clear.
-    Counts how many words of the text belong to each language's list and takes the clear winner.
-    (The LLM alone sometimes picked Portuguese for an English question, so we do not leave it to the LLM.)"""
-    words = re.findall(r"[^\W\d_]+", text.lower())
-    scores = {language: sum(1 for word in words if word in known) for language, known in LANGUAGE_WORDS.items()}
-    best = max(scores.values())
-    winners = [language for language, score in scores.items() if score == best]
-    return winners[0] if best > 0 and len(winners) == 1 else None
-
+from agent.language import guess_language
+from data_preprocessing.vector_data import rag_core
 
 def add_language_hint(question):
     """Add one sentence telling the agent which language the user wrote in.
@@ -205,6 +193,8 @@ def search_reviews(
     max_rating: int | None = None,
     min_rating: int | None = None,
     product_category: str | None = None,
+    seller_id: str | None = None,
+    product_id: str | None = None,
     seller_city: str | None = None,
     order_id: str | None = None,
     min_price: float | None = None,
@@ -216,10 +206,10 @@ def search_reviews(
     Use this to find out what customers say: complaints, praise, reasons for a bad rating,
     opinions about a product type.
 
-    The reviews are written in Portuguese, but the query can be English or Portuguese.
+    The reviews are written in Portuguese, so write the query in Portuguese (it matches much better).
 
     Arguments:
-        query: what to look for, e.g. "late delivery" or "produto quebrado".
+        query: what to look for, in Portuguese, e.g. "atraso na entrega" or "produto quebrado".
         answer_language: the language the USER wrote in (or asked for), e.g. "English", "Bahasa Indonesia"
             or "Portuguese". Decide this first. The tool reminds you of it when it returns the reviews.
         how_many: number of reviews to return, 1 to 10 (default 5).
@@ -228,6 +218,8 @@ def search_reviews(
         product_category: only reviews of orders that contain this ENGLISH category, e.g. "health_beauty".
         seller_city: only reviews of orders from sellers in this city, e.g. "sao paulo".
         order_id: the review of ONE specific order (the long id). Use it with a general query like "avaliação".
+        seller_id: only reviews of orders from ONE seller (the long seller id, copied exactly). Use it when the question is about a specific seller or shop. With no other topic, use a general query like "reclamação".
+        product_id: only reviews of orders that contain ONE specific product (the long product id, copied exactly).
         min_price: only orders with an item that costs at least this many Brazilian reais (BRL).
         max_price: only orders with an item that costs at most this many reais (BRL).
         must_contain: a regular expression the review text must match (case-insensitive). Use it when the user
@@ -251,6 +243,10 @@ def search_reviews(
         filters["seller_city"] = seller_city
     if order_id:
         filters["order_id"] = order_id.strip()
+    if seller_id:
+        filters["seller_id"] = seller_id.strip()
+    if product_id:
+        filters["product_id"] = product_id.strip()
 
     price_range = {}
     if min_price is not None:
@@ -286,7 +282,9 @@ def search_reviews(
     # Drop reviews that are clearly not about the topic. The search ALWAYS returns the closest reviews,
     # even for a nonsense question, so without this the LLM would see unrelated reviews and might list them.
     best_score = max(hit["relevance_score"] for hit in results)
-    if not order_id:                     # when we look up one order, the score means nothing
+     # The score means nothing when we look up one order, or when the filters are the topic (general query).
+    use_score = not order_id and not is_general_query(query)
+    if use_score:
         results = [hit for hit in results if hit["relevance_score"] >= MIN_MATCH]
     if not results:
         return (f"No relevant reviews found: the closest ones scored only {best_score:.2f} "
@@ -308,7 +306,7 @@ def search_reviews(
         meta = hit["metadata"]
         categories = format_categories(meta.get("product_name", []))
         prices = ", ".join(str(price) for price in meta.get("price", []))
-        weak = " (weak)" if hit["relevance_score"] < WEAK_MATCH and not order_id else ""
+        weak = " (weak)" if hit["relevance_score"] < WEAK_MATCH and use_score else ""
         lines.append(
             f"{number}) match {hit['relevance_score']:.2f}{weak} | rating {meta.get('review_score')}/5 | "
             f"category: {categories} | price: {prices} BRL | city: {meta.get('seller_city')} | "
@@ -329,6 +327,13 @@ def search_reviews(
             limits.append(f"at most {max_price:g}")
         lines.append(f"\nPRICE FILTER USED: an item price of {' and '.join(limits)} BRL. Tell the user which price "
                      f"limit you used, and add each quote's price to the parentheses (price: ... BRL).")
+
+    # When EVERY review is weak, the search probably found nothing about the topic. Say it here in code:
+    # with only the prompt, the LLM still listed weak reviews (tested: "bitcoin", "chocolate cake").
+    if use_score and all(hit["relevance_score"] < WEAK_MATCH for hit in results):
+        lines.append("\nALL MATCHES ARE WEAK: none of these reviews is clearly about the question. Read each one and "
+                     "quote ONLY reviews that really answer it. If none does, say that nothing relevant was found "
+                     "and do NOT list any review, not even as an example.")
 
     # The LAST thing the LLM reads before it writes its answer is a reminder of the answer language.
     # (Without this, the LLM tends to slip back into English after reading the results.)
@@ -378,12 +383,15 @@ Example, question in English (answer_language "English"):
   These reviews show dissatisfaction with product quality.
 
 HOW TO WORK
-- Search in English or Portuguese.
+- Write the search query in PORTUGUESE, even when the user writes in another language: the reviews are
+  Portuguese and Portuguese queries match much better (e.g. "atraso na entrega", not "late delivery").
 - Use the filters when the question mentions a rating, a product category or a seller city.
   Complaints usually mean max_rating=2, praise means min_rating=4.
 - The query is only the TOPIC, e.g. "produto quebrado" or "atraso na entrega". Do NOT repeat a category,
   city or rating in the query: use the filters for those.
-  If the question has NO topic besides the filters (e.g. "low-rated health_beauty products"), use a general
+  KEEP the topic of the question in the query: "praise about fast shipping" -> query "entrega rápida" with
+  min_rating=4, NOT "elogio". "complaints about late delivery" -> query "atraso na entrega" with max_rating=2.
+  Only If the question has NO topic besides the filters (e.g. "low-rated health_beauty products"), use a general
   query: "reclamação" for low ratings, "elogio" for high ratings, "opinião sobre o produto" otherwise.
   Never use a category name such as "health_beauty" as the query.
 - "worst" or "lowest rated" means max_rating=1.
@@ -391,6 +399,7 @@ HOW TO WORK
 - Price: "expensive", "cheap" or an amount -> min_price / max_price (Brazilian reais). Pick a sensible limit
   (e.g. min_price=150 for "expensive", max_price=50 for "cheap") and tell the user which limit you used.
 - A specific order -> order_id, with the general query "avaliação". The search cannot find an order any other way.
+- A specific seller -> seller_id; a specific product -> product_id (copy the long id exactly). If the question has no other topic, use a general query: "reclamação" for low ratings, "elogio" for high ratings.
 - If the first search is not useful, try again with different words or fewer filters.
 - Reply with: 1) a short summary of the main themes, 2) two to four example quotes.
 - RELEVANCE: the search always returns the closest reviews, even when none is really about the topic.

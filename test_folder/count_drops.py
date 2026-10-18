@@ -1,4 +1,4 @@
-# count_drops.py - run from the folder where text_cleaning.py is
+# run from the project root: python -m test_folder.count_drops
 import os
 import pandas as pd
 from data_preprocessing.vector_data import text_cleaning as tc
