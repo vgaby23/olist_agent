@@ -1,5 +1,5 @@
 import streamlit as st
-from src.agents import supervisor_agent
+from agent.agents import supervisor_agent
 
 AGENTS_BY_ROLE = {
 	"Customer": "customer_agent",

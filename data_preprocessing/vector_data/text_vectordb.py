@@ -20,7 +20,7 @@ from functools import lru_cache
 from langchain_qdrant import QdrantVectorStore
 from qdrant_client import QdrantClient, models
 
-from Data_Preprocessing.Vector_Data import text_embedding
+from data_preprocessing.vector_data import text_embedding
 
 COLLECTION_NAME = os.environ.get("COLLECTION_NAME", "olist_reviews")
 QDRANT_URL = os.environ.get("QDRANT_URL", "http://localhost:6333")
