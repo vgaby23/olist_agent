@@ -1,12 +1,23 @@
 """
-Cleaning dataset Olist -> SQLite (untuk SQL Agent) + dokumen review (untuk RAG Agent / Qdrant)
+Cleaning dataset Olist -> SQLite (untuk SQL Agent).
+(Data review untuk RAG ada di Qdrant, dibuat oleh data_preprocessing/vector_data/text_ingest.py.)
 
-Cara pakai:
-    python clean_olist.py --data-dir ./OlistDataset --out-dir ./output
+Prinsip: CSV mentah tidak diubah; hasil bersih ditulis ke olist.db baru.
+
+Cara pakai (dari folder utama proyek):
+    python data_preprocessing/numeric_data/clean_olist.py
+
+Aturan cleaning:
+    - revenue = SUM(order_items.price) dari order delivered; order lain tidak dihapus, hanya ditandai
+    - periode analisis 2017-01 s/d 2018-08 (kolom purchase_month, purchase_year, in_trend_period)
+    - ulasan ganda: ulasan PERTAMA per order dipakai (pendapat final pembeli); teks ulasan tidak disimpan
+    - produk tanpa kategori: 'uncategorized'; dua kategori tanpa terjemahan ditambahkan
+    - pembayaran: not_defined dibuang, cicilan 0 -> 1, voucher bernilai 0 -> NULL
+    - kota seller dibersihkan (clean_city); data customer tidak diubah
+    - is_late dibandingkan per tanggal (estimasi pengiriman selalu jam 00:00)
 
 Hasil:
-    output/olist.db        -> database SQLite bersih
-    output/rag_docs.csv    -> dokumen review siap di-embed ke Qdrant
+    data/olist.db          -> database SQLite bersih
 """
 import argparse
 import os
@@ -17,190 +28,227 @@ import unicodedata
 import numpy as np
 import pandas as pd
 
-parser = argparse.ArgumentParser()
-parser.add_argument("--data-dir", default="/mnt/project")
-parser.add_argument("--out-dir", default="/mnt/user-data/outputs")
-args = parser.parse_args()
-os.makedirs(args.out_dir, exist_ok=True)
+# Rentang tren yang valid: data sebelum 2017-01 dan sesudah 2018-08 parsial
+TREND_START, TREND_END = "2017-01", "2018-08"
+
+# Label untuk produk tanpa kategori
+UNCATEGORIZED = "uncategorized"
+
+# Dua kategori yang tidak ada di file terjemahan
+EXTRA_TRANSLATIONS = {
+    "pc_gamer": "pc_gamer",
+    "portateis_cozinha_e_preparadores_de_alimentos": "portable_kitchen_and_food_preparers",
+}
+
+# Lookup kode negara bagian Brasil -> nama
+BR_STATES = {
+    "AC": ("Acre", "North"), "AL": ("Alagoas", "Northeast"), "AP": ("Amapá", "North"),
+    "AM": ("Amazonas", "North"), "BA": ("Bahia", "Northeast"), "CE": ("Ceará", "Northeast"),
+    "DF": ("Distrito Federal", "Central-West"), "ES": ("Espírito Santo", "Southeast"),
+    "GO": ("Goiás", "Central-West"), "MA": ("Maranhão", "Northeast"), "MT": ("Mato Grosso", "Central-West"),
+    "MS": ("Mato Grosso do Sul", "Central-West"), "MG": ("Minas Gerais", "Southeast"),
+    "PA": ("Pará", "North"), "PB": ("Paraíba", "Northeast"), "PR": ("Paraná", "South"),
+    "PE": ("Pernambuco", "Northeast"), "PI": ("Piauí", "Northeast"), "RJ": ("Rio de Janeiro", "Southeast"),
+    "RN": ("Rio Grande do Norte", "Northeast"), "RS": ("Rio Grande do Sul", "South"),
+    "RO": ("Rondônia", "North"), "RR": ("Roraima", "North"), "SC": ("Santa Catarina", "South"),
+    "SP": ("São Paulo", "Southeast"), "SE": ("Sergipe", "Northeast"), "TO": ("Tocantins", "North"),
+}
 
 
-def read(name, **kw):
-    return pd.read_csv(os.path.join(args.data_dir, name), **kw)
+# Kota seller: salah ketik yang diperbaiki manual (dicek satu per satu; sengaja tidak pakai fuzzy otomatis
+# karena 'sao jose do rio pardo' dan 'itapeva' adalah kota asli yang mirip kota lain)
+CITY_FIXES = {
+    "sp": "sao paulo", "sao paulo sp": "sao paulo", "sao pauo": "sao paulo", "sao paluo": "sao paulo",
+    "sao paulop": "sao paulo", "sbc": "sao bernardo do campo", "sao bernardo do capo": "sao bernardo do campo",
+    "ao bernardo do campo": "sao bernardo do campo", "belo horizont": "belo horizonte", "cascavael": "cascavel",
+    "sao jose dos pinhas": "sao jose dos pinhais", "balenario camboriu": "balneario camboriu",
+    "floranopolis": "florianopolis", "mogi das cruses": "mogi das cruzes",
+    "s jose do rio preto": "sao jose do rio preto", "sao jose do rio pret": "sao jose do rio preto",
+    "scao jose do rio pardo": "sao jose do rio pardo", "portoferreira": "porto ferreira",
+    "sando andre": "santo andre", "garulhos": "guarulhos", "ribeirao pretp": "ribeirao preto",
+    "santa barbara d oeste": "santa barbara d'oeste", "sao miguel d'oeste": "sao miguel do oeste",
+    "robeirao preto": "ribeirao preto", "riberao preto": "ribeirao preto", "tabao da serra": "taboao da serra",
+}
 
 
-def iso(df, cols):
-    """Datetime -> string ISO supaya bisa dipakai strftime() di SQLite."""
+def clean_city(city):
+    """Nama kota seragam: huruf kecil tanpa aksen, buang '/ sp', '- sp', ', brasil', '(...)'.
+    Mengembalikan None kalau isinya bukan nama kota (angka, email)."""
+    if pd.isna(city):
+        return None
+    city = unicodedata.normalize("NFKD", str(city)).encode("ascii", "ignore").decode().lower()
+    city = city.replace("´", "'").replace("`", "'")
+    city = re.split(r"\s*[/\\,(]\s*|\s+-\s+|-(?=[a-z]{2}$)", city)[0]
+    city = re.sub(r"\s+", " ", city).strip()
+    city = CITY_FIXES.get(city, city)
+    return city if re.fullmatch(r"[a-z][a-z' ]+", city) else None
+
+
+def clean_seller_cities(sellers):
+    """clean_city untuk seller; kalau gagal, ambil kota terbanyak dari seller lain dengan zip prefix sama."""
+    sellers["seller_city"] = sellers["seller_city"].map(clean_city)
+    by_zip = (sellers.dropna(subset=["seller_city"])
+              .groupby("seller_zip_code_prefix")["seller_city"].agg(lambda c: c.value_counts().index[0]))
+    missing = sellers["seller_city"].isna()
+    sellers.loc[missing, "seller_city"] = sellers.loc[missing, "seller_zip_code_prefix"].map(by_zip)
+    sellers["seller_city"] = sellers["seller_city"].fillna("unknown")
+    return sellers
+
+
+def read(data_dir, name, **kw):
+    return pd.read_csv(os.path.join(data_dir, name), encoding="utf-8-sig", **kw)
+
+
+def fmt_dates(df, cols):
+    """Simpan tanggal sebagai TEXT 'YYYY-MM-DD HH:MM:SS' (NULL kalau kosong)."""
     for c in cols:
         df[c] = df[c].dt.strftime("%Y-%m-%d %H:%M:%S")
     return df
 
 
-# ------------------------------------------------------------------ LOAD
-customers = read("olist_customers_dataset.csv")
-orders = read("olist_orders_dataset.csv")
-items = read("olist_order_items_dataset.csv")
-payments = read("olist_order_payments_dataset.csv")
-reviews = read("olist_order_reviews_dataset.csv")
-products = read("olist_products_dataset.csv")
-sellers = read("olist_sellers_dataset.csv")
-trans = read("product_category_name_translation.csv", encoding="utf-8-sig")
-print("Loaded OK")
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--data-dir", default="./Dataset")
+    parser.add_argument("--out-dir", default="./data")
+    parser.add_argument("--review-pick", choices=["first", "latest"], default="first",
+                        help="ulasan mana yang dipakai kalau 1 order punya >1 ulasan")
+    args = parser.parse_args()
+    os.makedirs(args.out_dir, exist_ok=True)
+    d = args.data_dir
 
-# ------------------------------------------------------------------ TRANSLATION + PRODUCTS
-# 2 kategori yang tidak ada di file terjemahan
-trans = pd.concat(
-    [trans, pd.DataFrame({
-        "product_category_name": ["portateis_cozinha_e_preparadores_de_alimentos", "pc_gamer"],
-        "product_category_name_english": ["portable_kitchen_and_food_preparers", "pc_gamer"],
-    })],
-    ignore_index=True,
-)
-products = products.merge(trans, on="product_category_name", how="left")
-products["product_category_name"] = products["product_category_name"].fillna("unknown")
-products["product_category_name_english"] = products["product_category_name_english"].fillna("unknown")
-# Sesuai PRD: dimensi, berat, panjang nama/deskripsi tidak dipakai
-products = products[["product_id", "product_category_name", "product_category_name_english", "product_photos_qty"]]
+    # ------------------------------------------------------------------ CUSTOMERS (tidak diubah)
+    customers = read(d, "olist_customers_dataset.csv", dtype={"customer_zip_code_prefix": str})
 
-# ------------------------------------------------------------------ SELLERS
-def clean_city(x):
-    x = str(x).lower().strip().replace("´", "'").replace("`", "'")
-    x = unicodedata.normalize("NFKD", x).encode("ascii", "ignore").decode()
-    if re.fullmatch(r"[\d\s\-]+", x):          # isinya kode pos
-        return "unknown"
-    x = re.split(r"\s*[/,\\(]\s*", x)[0].strip()  # buang "/sp", ", brasil", "(porto seguro)"
-    x = {"sbc": "sao bernardo do campo"}.get(x, x)
-    return x or "unknown"
+    # ------------------------------------------------------------------ SELLERS (nama kota dibersihkan)
+    sellers = read(d, "olist_sellers_dataset.csv", dtype={"seller_zip_code_prefix": str})
+    raw_cities = sellers["seller_city"].nunique()
+    sellers = clean_seller_cities(sellers)
+
+    # ------------------------------------------------------------------ BR_STATES
+    br_states = pd.DataFrame([(k, v[0], v[1]) for k, v in BR_STATES.items()],
+                             columns=["state_code", "state_name", "region"])
+
+    # ------------------------------------------------------------------ PRODUCTS (kategori + terjemahan; dimensi & berat dibuang)
+    products = read(d, "olist_products_dataset.csv")
+    translation = read(d, "product_category_name_translation.csv")
+    translation.columns = [c.strip() for c in translation.columns]
+    tmap = dict(zip(translation.product_category_name, translation.product_category_name_english))
+    tmap.update(EXTRA_TRANSLATIONS)
+    products["product_category_name"] = products["product_category_name"].fillna(UNCATEGORIZED)
+    products["product_category_name_english"] = (
+        products["product_category_name"].map(tmap).fillna(UNCATEGORIZED))
+    products = products[["product_id", "product_category_name", "product_category_name_english"]]
+
+    # ------------------------------------------------------------------ ORDER ITEMS
+    items = read(d, "olist_order_items_dataset.csv", parse_dates=["shipping_limit_date"])
+    items = fmt_dates(items, ["shipping_limit_date"])
+
+    # ------------------------------------------------------------------ PAYMENTS
+    payments = read(d, "olist_order_payments_dataset.csv")
+    payments = payments[payments["payment_type"] != "not_defined"].copy()           # 3 baris (order canceled)
+    payments.loc[payments["payment_installments"] == 0, "payment_installments"] = 1  # 2 baris credit card
+    # voucher bernilai 0 -> NULL: SUM tidak berubah, AVG otomatis melewatinya
+    payments["payment_value"] = payments["payment_value"].astype(float)
+    payments.loc[(payments["payment_type"] == "voucher") & (payments["payment_value"] == 0),
+                 "payment_value"] = np.nan
+
+    # ------------------------------------------------------------------ REVIEWS (1 ulasan per order, tanpa teks)
+    reviews = read(d, "olist_order_reviews_dataset.csv",
+                   parse_dates=["review_creation_date", "review_answer_timestamp"])
+    reviews = reviews[["review_id", "order_id", "review_score",
+                       "review_creation_date", "review_answer_timestamp"]]           # tanpa teks
+    if args.review_pick == "first":    # default: ulasan pertama = pendapat final pembeli
+        reviews = reviews.sort_values(["order_id", "review_creation_date", "review_answer_timestamp"]
+                                      ).drop_duplicates("order_id", keep="first")
+    else:                              # alternatif: review_answer_timestamp terbaru
+        reviews = reviews.sort_values(["order_id", "review_answer_timestamp"]).drop_duplicates("order_id", keep="last")
+    reviews = fmt_dates(reviews, ["review_creation_date", "review_answer_timestamp"])
+
+    # ------------------------------------------------------------------ ORDERS (+ kolom turunan)
+    date_cols = ["order_purchase_timestamp", "order_approved_at", "order_delivered_carrier_date",
+                 "order_delivered_customer_date", "order_estimated_delivery_date"]
+    orders = read(d, "olist_orders_dataset.csv", parse_dates=date_cols)
+
+    # Order tidak dihapus, cukup ditandai. Delivered = status delivered DAN tanggal sampai tercatat.
+    orders["is_delivered"] = ((orders["order_status"] == "delivered")
+                              & orders["order_delivered_customer_date"].notna()).astype(int)
+
+    # Kolom periode dibuat saat cleaning (agent tidak memotong timestamp sendiri)
+    orders["purchase_month"] = orders["order_purchase_timestamp"].dt.strftime("%Y-%m")
+    orders["purchase_year"] = orders["order_purchase_timestamp"].dt.year.astype(int)
+    orders["in_trend_period"] = orders["purchase_month"].between(TREND_START, TREND_END).astype(int)
+
+    # Pengiriman: tanggal estimasi selalu jam 00:00, jadi bandingkan TANGGAL-nya saja.
+    delivered = orders["is_delivered"] == 1
+    orders["is_late"] = np.where(
+        delivered,
+        (orders["order_delivered_customer_date"].dt.normalize()
+         > orders["order_estimated_delivery_date"].dt.normalize()).astype(float),
+        np.nan)
+    orders["delivery_days"] = np.where(
+        delivered,
+        ((orders["order_delivered_customer_date"] - orders["order_purchase_timestamp"])
+         .dt.total_seconds() / 86400).round(1),
+        np.nan)
+
+    # Ringkasan nilai per order dari order_items (payment_value tidak dipakai untuk revenue)
+    per_order = items.groupby("order_id").agg(items_value=("price", "sum"),
+                                              freight_total=("freight_value", "sum"),
+                                              n_items=("order_item_id", "count")).reset_index()
+    orders = orders.merge(per_order, on="order_id", how="left")
+    orders[["items_value", "freight_total", "n_items"]] = orders[["items_value", "freight_total", "n_items"]].fillna(0)
+    orders["n_items"] = orders["n_items"].astype(int)                       # jumlah barang = bilangan bulat
+    orders["items_value"] = orders["items_value"].round(2)
+    orders["freight_total"] = orders["freight_total"].round(2)
+    orders["order_total"] = (orders["items_value"] + orders["freight_total"]).round(2)
+    orders = fmt_dates(orders, date_cols)
+
+    # ------------------------------------------------------------------ TULIS KE SQLITE
+    db_path = os.path.join(args.out_dir, "olist.db")
+    if os.path.exists(db_path):
+        os.remove(db_path)
+    conn = sqlite3.connect(db_path)
+    tables = {"customers": customers, "sellers": sellers, "br_states": br_states, "products": products,
+              "orders": orders, "order_items": items, "order_payments": payments, "order_reviews": reviews}
+    for name, df in tables.items():
+        df.to_sql(name, conn, index=False)
+
+    indexes = [
+        "CREATE UNIQUE INDEX ix_customers_pk  ON customers(customer_id)",
+        "CREATE INDEX        ix_customers_uid ON customers(customer_unique_id)",
+        "CREATE UNIQUE INDEX ix_sellers_pk    ON sellers(seller_id)",
+        "CREATE UNIQUE INDEX ix_products_pk   ON products(product_id)",
+        "CREATE UNIQUE INDEX ix_orders_pk     ON orders(order_id)",
+        "CREATE INDEX        ix_orders_cust   ON orders(customer_id)",
+        "CREATE INDEX        ix_orders_month  ON orders(purchase_month)",
+        "CREATE UNIQUE INDEX ix_items_pk      ON order_items(order_id, order_item_id)",
+        "CREATE INDEX        ix_items_seller  ON order_items(seller_id)",
+        "CREATE INDEX        ix_items_product ON order_items(product_id)",
+        "CREATE UNIQUE INDEX ix_pay_pk        ON order_payments(order_id, payment_sequential)",
+        "CREATE UNIQUE INDEX ix_reviews_pk    ON order_reviews(review_id, order_id)",
+        "CREATE UNIQUE INDEX ix_reviews_order ON order_reviews(order_id)",              # 1 ulasan per order
+    ]
+    for sql in indexes:
+        conn.execute(sql)
+    conn.commit()
+
+    # ------------------------------------------------------------------ VALIDASI SINGKAT
+    q = lambda sql: conn.execute(sql).fetchone()[0]
+    print("database                  :", db_path, f"({os.path.getsize(db_path) / 1e6:.0f} MB)")
+    for name in tables:
+        print(f"  {name:<24}:", q(f"SELECT COUNT(*) FROM {name}"))
+    print("orders delivered          :", q("SELECT SUM(is_delivered) FROM orders"))
+    print("revenue delivered (R$)    :", q("SELECT ROUND(SUM(oi.price),2) FROM order_items oi "
+                                           "JOIN orders o USING(order_id) WHERE o.is_delivered=1"))
+    print("on-time rate              :", q("SELECT ROUND(1-AVG(is_late),4) FROM orders WHERE is_delivered=1"))
+    print("avg review_score          :", q("SELECT ROUND(AVG(review_score),3) FROM order_reviews"))
+    print("produk uncategorized      :", q(f"SELECT COUNT(*) FROM products "
+                                           f"WHERE product_category_name_english='{UNCATEGORIZED}'"))
+    print("bulan dalam tren          :", q("SELECT COUNT(DISTINCT purchase_month) FROM orders WHERE in_trend_period=1"))
+    print("kota seller (mentah->bersih):", raw_cities, "->", q("SELECT COUNT(DISTINCT seller_city) FROM sellers"))
+    print("review pick               :", args.review_pick)
+    conn.close()
 
 
-sellers["seller_city"] = sellers["seller_city"].map(clean_city)
-
-# ------------------------------------------------------------------ ORDERS
-dt_cols = ["order_purchase_timestamp", "order_approved_at", "order_delivered_carrier_date",
-           "order_delivered_customer_date", "order_estimated_delivery_date"]
-for c in dt_cols:
-    orders[c] = pd.to_datetime(orders[c])
-
-# tanggal tidak logis -> NULL
-orders.loc[orders["order_delivered_carrier_date"] < orders["order_purchase_timestamp"],
-           "order_delivered_carrier_date"] = pd.NaT
-orders.loc[orders["order_status"] != "delivered", "order_delivered_customer_date"] = pd.NaT
-
-# kolom turunan
-orders["is_delivered"] = ((orders["order_status"] == "delivered")
-                          & orders["order_delivered_customer_date"].notna()).astype(int)
-delivery = orders["order_delivered_customer_date"] - orders["order_purchase_timestamp"]
-orders["delivery_days"] = (delivery.dt.total_seconds() / 86400).round(1)
-orders["is_late"] = np.where(
-    orders["is_delivered"] == 1,
-    (orders["order_delivered_customer_date"] > orders["order_estimated_delivery_date"]).astype(float),
-    np.nan,
-)
-orders["purchase_month"] = orders["order_purchase_timestamp"].dt.strftime("%Y-%m")
-# bulan 2016-09, 2016-12, 2018-09, 2018-10 hampir kosong -> jangan dipakai untuk tren/forecast
-orders["in_trend_period"] = orders["purchase_month"].between("2017-01", "2018-08").astype(int)
-
-# total nilai order dari item (harga + ongkir)
-tot = items.groupby("order_id").agg(items_value=("price", "sum"), freight_total=("freight_value", "sum"),
-                                    n_items=("order_item_id", "count")).reset_index()
-orders = orders.merge(tot, on="order_id", how="left")
-orders[["items_value", "freight_total", "n_items"]] = orders[["items_value", "freight_total", "n_items"]].fillna(0)
-orders["order_total"] = (orders["items_value"] + orders["freight_total"]).round(2)
-
-# ------------------------------------------------------------------ ORDER ITEMS
-items["shipping_limit_date"] = pd.to_datetime(items["shipping_limit_date"])
-
-# ------------------------------------------------------------------ PAYMENTS
-payments = payments[payments["payment_value"] > 0].copy()      # buang not_defined & nilai 0
-payments["payment_installments"] = payments["payment_installments"].clip(lower=1)
-
-# ------------------------------------------------------------------ REVIEWS
-reviews["review_creation_date"] = pd.to_datetime(reviews["review_creation_date"])
-reviews["review_answer_timestamp"] = pd.to_datetime(reviews["review_answer_timestamp"])
-# 1 review per order (yang terbaru)
-reviews = (reviews.sort_values("review_answer_timestamp")
-           .drop_duplicates("order_id", keep="last")
-           .reset_index(drop=True))
-
-# teks bersih untuk RAG
-def clean_text(s):
-    if pd.isna(s):
-        return ""
-    return re.sub(r"\s+", " ", str(s)).strip()
-
-
-reviews["review_comment_title"] = reviews["review_comment_title"].map(clean_text)
-reviews["review_comment_message"] = reviews["review_comment_message"].map(clean_text)
-
-# ------------------------------------------------------------------ RAG DOCS
-rag = reviews[reviews["review_comment_message"].str.len() > 3].copy()
-pair = (items.groupby(["order_id", "product_id", "seller_id"], as_index=False)
-        .agg(price=("price", "mean")))
-rag = (rag.merge(pair, on="order_id")
-       .merge(products[["product_id", "product_category_name_english"]], on="product_id", how="left")
-       .merge(sellers[["seller_id", "seller_city", "seller_state"]], on="seller_id", how="left"))
-rag = rag.rename(columns={"product_category_name_english": "product_category"})
-
-
-def build_doc(r):
-    parts = [f"Category: {r.product_category}", f"Seller location: {r.seller_city}, {r.seller_state}"]
-    if r.review_comment_title:
-        parts.append(f"Title: {r.review_comment_title}")
-    parts.append(f"Review: {r.review_comment_message}")
-    return " | ".join(parts)
-
-
-rag["page_content"] = rag.apply(build_doc, axis=1)
-rag = rag[["review_id", "order_id", "product_id", "seller_id", "product_category",
-           "seller_city", "seller_state", "review_score", "price", "page_content"]]
-rag.to_csv(os.path.join(args.out_dir, "rag_docs.csv"), index=False)
-
-# Tabel review untuk SQLite: skor saja, tanpa teks (sesuai PRD)
-reviews_sql = reviews[["review_id", "order_id", "review_score",
-                       "review_creation_date", "review_answer_timestamp"]].copy()
-
-# ------------------------------------------------------------------ WRITE SQLITE
-orders = iso(orders, dt_cols)
-items = iso(items, ["shipping_limit_date"])
-reviews_sql = iso(reviews_sql, ["review_creation_date", "review_answer_timestamp"])
-
-db_path = os.path.join(args.out_dir, "olist.db")
-if os.path.exists(db_path):
-    os.remove(db_path)
-conn = sqlite3.connect(db_path)
-for name, df in [("customers", customers), ("orders", orders), ("order_items", items),
-                 ("order_payments", payments), ("order_reviews", reviews_sql),
-                 ("products", products), ("sellers", sellers)]:
-    df.to_sql(name, conn, index=False)
-
-for stmt in [
-    "CREATE UNIQUE INDEX ix_cust_id ON customers(customer_id)",
-    "CREATE INDEX ix_cust_unique ON customers(customer_unique_id)",
-    "CREATE UNIQUE INDEX ix_ord_id ON orders(order_id)",
-    "CREATE INDEX ix_ord_cust ON orders(customer_id)",
-    "CREATE INDEX ix_ord_month ON orders(purchase_month)",
-    "CREATE INDEX ix_item_order ON order_items(order_id)",
-    "CREATE INDEX ix_item_prod ON order_items(product_id)",
-    "CREATE INDEX ix_item_sell ON order_items(seller_id)",
-    "CREATE INDEX ix_pay_order ON order_payments(order_id)",
-    "CREATE UNIQUE INDEX ix_rev_order ON order_reviews(order_id)",
-    "CREATE UNIQUE INDEX ix_prod_id ON products(product_id)",
-    "CREATE UNIQUE INDEX ix_sell_id ON sellers(seller_id)",
-]:
-    conn.execute(stmt)
-conn.commit()
-
-# ------------------------------------------------------------------ VALIDASI
-print("\n=== VALIDASI ===")
-q = lambda s: conn.execute(s).fetchone()[0]
-for t in ["customers", "orders", "order_items", "order_payments", "order_reviews", "products", "sellers"]:
-    print(f"{t:15s}", q(f"SELECT COUNT(*) FROM {t}"))
-print("review duplikat per order :", q("SELECT COUNT(*) FROM (SELECT order_id FROM order_reviews GROUP BY order_id HAVING COUNT(*)>1)"))
-print("payment not_defined       :", q("SELECT COUNT(*) FROM order_payments WHERE payment_type='not_defined'"))
-print("produk kategori unknown   :", q("SELECT COUNT(*) FROM products WHERE product_category_name_english='unknown'"))
-print("order delivered valid     :", q("SELECT SUM(is_delivered) FROM orders"))
-print("order di periode tren     :", q("SELECT SUM(in_trend_period) FROM orders"))
-print("seller city aneh          :", q("SELECT COUNT(*) FROM sellers WHERE seller_city GLOB '*[^a-z '' -]*'"))
-print("dokumen RAG               :", len(rag))
-print("avg review_score          :", round(q("SELECT AVG(review_score) FROM order_reviews"), 3))
-conn.close()
-print("\nSelesai ->", args.out_dir)
+if __name__ == "__main__":
+    main()
