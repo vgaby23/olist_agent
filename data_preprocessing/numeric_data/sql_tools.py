@@ -11,7 +11,7 @@ from pathlib import Path
 
 import pandas as pd
 
-DB_PATH = Path(__file__).resolve().parent.parent / "data" / "olist.db"
+DB_PATH = Path(__file__).resolve().parent.parent.parent / "data" / "olist.db"
 MAX_ROWS = 50  # batas baris hasil supaya jawaban tidak terlalu panjang
 
 FORBIDDEN = re.compile(

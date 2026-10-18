@@ -75,22 +75,9 @@ LLM_MODEL = os.environ.get("LLM_MODEL", "gpt-4o-mini")      # the OpenAI chat mo
 SEARCH_POOL = 50                                            # how many reviews are checked when must_contain is used
 MIN_MATCH = float(os.environ.get("MIN_MATCH", "0.20"))      # below this a review is dropped (0 = keep everything)
 WEAK_MATCH = float(os.environ.get("WEAK_MATCH", "0.35"))    # below this a review is marked "(weak)"
-
-# rag_core.py lives in Data_Preprocessing/Vector_Data. Python only imports from certain folders, so we
-# add that folder (and the folder of this file) to the list.
 THIS_FOLDER = Path(__file__).resolve().parent
-for folder in (THIS_FOLDER, THIS_FOLDER.parent / "Data_Preprocessing" / "Vector_Data"):
-    if str(folder) not in sys.path:
-        sys.path.append(str(folder))
 
-# Two ways to search (the only difference between running on your laptop and running in the cloud):
-#   RAG_API_URL not set -> import rag_core and search Qdrant directly (needs qdrant-client, OPENAI_API_KEY...)
-#   RAG_API_URL set     -> send a POST /retrieve to the RAG API (the container); no Qdrant code is needed here
-RAG_API_URL = os.environ.get("RAG_API_URL", "").strip()
-if RAG_API_URL:
-    rag_core = None
-else:
-    from Data_Preprocessing.Vector_Data import rag_core  # noqa: E402  (this import has to come after the lines above)
+from data_preprocessing.vector_data import rag_core  
 
 
 # Words that tell the three languages of this project apart. Words that exist in two of them
@@ -168,24 +155,9 @@ def explain_error(error):
 
 
 def retrieve(query, top_k, filters):
-    """The ONE place where this agent talks to the search code.
-
-    - RAG_API_URL set (Docker / Cloud Run): sends a POST /retrieve request to the RAG API.
-    - RAG_API_URL not set: calls rag_core directly (handy on your laptop).
-    Returns a list of {"content", "relevance_score", "metadata"}.
-    """
-    if RAG_API_URL:
-        import agent_client                       # the small HTTP client for the API
-        return agent_client.retrieve(query, top_k=top_k, filters=filters, base_url=RAG_API_URL)
+    """The ONE place where this agent talks to the search code (rag_core.py, which searches Qdrant).
+    Returns a list of {"content", "relevance_score", "metadata"}."""
     return rag_core.search(query, top_k=top_k, filters=filters)
-
-
-def filter_errors():
-    """The exceptions that mean "the filters were wrong" (they depend on the search mode)."""
-    if RAG_API_URL:
-        import agent_client
-        return (agent_client.FilterRejected,)
-    return (rag_core.FilterError,)
 
 
 def find_categories():
@@ -303,7 +275,7 @@ def search_reviews(
     #    so the LLM can read it and try again (or tell the user).
     try:
         results = retrieve(query, fetch, filters)
-    except filter_errors() as error:
+    except rag_core.FilterError as error:
         return f"The filters were not valid: {error}"
     except Exception as error:
         return f"The review search failed: {type(error).__name__}: {str(error)[:200]}"

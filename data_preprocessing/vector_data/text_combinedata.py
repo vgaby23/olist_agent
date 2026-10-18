@@ -22,7 +22,7 @@ import uuid
 
 from langchain_core.documents import Document
 
-from Data_Preprocessing.Vector_Data import text_cleaning
+from data_preprocessing.vector_data import text_cleaning
 
 
 def group_items_by_order(items, product_names):

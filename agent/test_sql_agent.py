@@ -1,8 +1,8 @@
 """
 test_sql_agent.py - Menjalankan SQL Agent pada beberapa pertanyaan contoh.
-Jalankan dari folder utama proyek:  python scripts/test_sql_agent.py
+
 """
-from sql_agent import ask_sql_agent, get_llm
+from agent.sql_agent import ask_sql_agent, get_llm
 
 # (pertanyaan, role, jawaban acuan yang dihitung manual dari database)
 TESTS = [

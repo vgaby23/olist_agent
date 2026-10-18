@@ -12,7 +12,7 @@ import re
 # Aksara non-Latin (Ibrani, Arab, Thai, Cyrillic, CJK, dst.) yang tidak boleh muncul di jawaban
 FOREIGN_SCRIPT = re.compile(r"[\u0400-\u04FF\u0590-\u06FF\u0900-\u097F\u0E00-\u0E7F\u3040-\u30FF\u4E00-\u9FFF\uAC00-\uD7AF]")
 
-from sql_tools import get_schema, run_query
+from data_preprocessing.numeric_data.sql_tools import get_schema, run_query
 
 MAX_RETRIES = 2
 
@@ -61,7 +61,7 @@ def get_llm():
     from langchain_openai import ChatOpenAI
 
     load_dotenv()
-    return ChatOpenAI(model=os.getenv("OPENAI_MODEL", "gpt-5.4-mini"))
+    return ChatOpenAI(model=os.getenv("LLM_MODEL", "gpt-4o-mini"))
 
 
 def _text(response):
