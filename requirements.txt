@@ -1,0 +1,17 @@
+fastapi
+httpx
+langchain
+langchain-core
+langchain-openai
+langchain-text-splitters
+langchain-qdrant
+qdrant-client
+openai
+pydantic
+python-dotenv
+pandas
+pytest
+qdrant-client
+sentence-transformers
+streamlit
+uvicorn
