@@ -1,8 +1,8 @@
 from dotenv import load_dotenv
 load_dotenv()
 
-from data_preprocessing.vector_data import rag_core
-from data_preprocessing.vector_data import text_vectordb
+from dataset.preprocessing.vector_data import rag_core
+from dataset.preprocessing.vector_data import text_vectordb
 
 client = text_vectordb.get_client()
 name = text_vectordb.COLLECTION_NAME

@@ -24,13 +24,7 @@ from langchain.agents import create_agent
 from langchain_core.tools import InjectedToolCallId, tool
 from langgraph.errors import GraphRecursionError
 
-from data_preprocessing.numeric_data.sql_tools import get_schema, make_scope, run_query
-
-try:                                     # agent/language.py dipakai bersama RAG agent
-    from agent.language import guess_language
-except ImportError:                      # sementara file itu belum ada: biarkan LLM mengikuti bahasa pertanyaan
-    def guess_language(question):
-        return None
+from dataset.preprocessing.numeric_data.sql_tools import get_schema, make_scope, run_query
 
 # Aksara non-Latin (Ibrani, Arab, Thai, Cyrillic, CJK, dst.) yang tidak boleh muncul di jawaban
 FOREIGN_SCRIPT = re.compile(r"[Ѐ-ӿ֐-ۿऀ-ॿ฀-๿぀-ヿ一-鿿가-힯]")
@@ -102,6 +96,7 @@ WHEN THE DATABASE CANNOT ANSWER:
 - If the question cannot be answered with this database (for example profit, product name, seller name),
   do NOT call run_sql: politely say so in one or two short sentences and do not invent any data.
 """.strip()
+#### Tambah aturan untuk mapping product dengan kategori terdekat
 
 # Aturan menulis jawaban akhir (dulu prompt ringkasan terpisah; sekarang bagian dari system prompt agent)
 ANSWER_RULES = """
@@ -149,8 +144,7 @@ def _clean_sql(text):
 
 
 def pick_language(question, language=None):
-    """Bahasa jawaban: 1) argumen language kalau diisi, 2) petunjuk "Answer in X" dari supervisor,
-    3) kalau tidak ada: tebak dari kata-kata di pertanyaan (guess_language)."""
+    """Use the language supplied by the supervisor; default defensively if it is missing."""
     if language:
         return language
     hint = re.search(r"answer in ([A-Za-z][A-Za-z ]{1,30}?)\s*[.!\n]", question + "\n", re.IGNORECASE)

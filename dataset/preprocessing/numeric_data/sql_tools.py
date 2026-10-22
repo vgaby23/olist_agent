@@ -33,7 +33,7 @@ from pathlib import Path
 import pandas as pd
 
 ROOT = Path(__file__).resolve().parents[2]
-DB_PATH = Path(os.getenv("OLIST_DB_PATH", ROOT / "data" / "olist.db"))
+DB_PATH = Path(os.getenv("OLIST_DB_PATH", ROOT / "olist.db"))
 
 MAX_ROWS = 50            # baris maksimum yang dikembalikan ke LLM
 QUERY_TIMEOUT_S = 15     # detik maksimum per query
@@ -160,15 +160,24 @@ def make_scope(role="company", user_id=None):
         raise ValueError(f"A {role} id is required for the {role} role.")
     if not ID_PATTERN.fullmatch(user_id):      # dicek dulu sebelum id masuk ke teks SQL view
         raise ValueError(f"Invalid {role} id: {user_id!r}")
-    table, column = ("sellers", "seller_id") if role == "seller" else ("customers", "customer_unique_id")
     conn = get_connection()
     try:
-        found = conn.execute(f"SELECT 1 FROM {table} WHERE {column} = ? LIMIT 1", (user_id,)).fetchone()
+        if role == "seller":
+            found = conn.execute(
+                "SELECT seller_id FROM sellers WHERE seller_id = ? LIMIT 1",
+                (user_id,),
+            ).fetchone()
+        else:
+            found = conn.execute(
+                "SELECT customer_unique_id FROM customers "
+                "WHERE customer_unique_id = ? OR customer_id = ? LIMIT 1",
+                (user_id, user_id),
+            ).fetchone()
     finally:
         conn.close()
     if not found:
         raise ValueError(f"Unknown {role} id: {user_id}")
-    return Scope(role, user_id)
+    return Scope(role, found[0])
 
 
 def _scope_views(scope):

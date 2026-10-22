@@ -1,7 +1,7 @@
 # run from the project root: python -m test_folder.count_drops
 import os
 import pandas as pd
-from data_preprocessing.vector_data import text_cleaning as tc
+from dataset.preprocessing.vector_data import text_cleaning as tc
 
 DATA_DIR = "./Dataset"        # the folder with the Olist CSV files
 

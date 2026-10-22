@@ -182,8 +182,8 @@ def ask_with_media(text=None, audio_path=None, image_path=None, answer_language=
     except Exception as error:               # e.g. no internet, bad key: say it in words, don't crash
         return f"I couldn't process your voice/photo: {type(error).__name__}: {str(error)[:200]}"
 
-    from agent import RAG_agent                          # imported here so this file also works without Qdrant set up
-    return RAG_agent.ask_rag_agent(question, show_steps=show_steps)
+    from agent import rag_agent                          # imported here so this file also works without Qdrant set up
+    return rag_agent.ask_rag_agent(question, show_steps=show_steps)
 
 
 # =============================================================================

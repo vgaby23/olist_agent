@@ -20,13 +20,13 @@ from functools import lru_cache
 from langchain_qdrant import QdrantVectorStore
 from qdrant_client import QdrantClient, models
 
-from data_preprocessing.vector_data import text_embedding
+from dataset.preprocessing.vector_data import text_embedding
 
 COLLECTION_NAME = os.environ.get("COLLECTION_NAME", "olist_reviews")
 QDRANT_URL = os.environ.get("QDRANT_URL", "http://localhost:6333")
 QDRANT_API_KEY = os.environ.get("QDRANT_API_KEY") or None
 QDRANT_PATH = os.environ.get("QDRANT_PATH") or None
-
+    
 # LangChain saves our metadata under the name "metadata" inside Qdrant, so a field called
 # "review_score" is called "metadata.review_score" in Qdrant filters and indexes.
 META = "metadata."

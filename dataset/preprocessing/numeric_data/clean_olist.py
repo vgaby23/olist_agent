@@ -17,7 +17,7 @@ Aturan cleaning:
     - is_late dibandingkan per tanggal (estimasi pengiriman selalu jam 00:00)
 
 Hasil:
-    data/olist.db          -> database SQLite bersih
+    dataset/olist.db          -> database SQLite bersih
 """
 import argparse
 import os
@@ -108,8 +108,8 @@ def fmt_dates(df, cols):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--data-dir", default="./Dataset")
-    parser.add_argument("--out-dir", default="./data")
+    parser.add_argument("--data-dir", default="./dataset")
+    parser.add_argument("--out-dir", default="./dataset")
     parser.add_argument("--review-pick", choices=["first", "latest"], default="first",
                         help="ulasan mana yang dipakai kalau 1 order punya >1 ulasan")
     args = parser.parse_args()
@@ -117,10 +117,10 @@ def main():
     d = args.data_dir
 
     # ------------------------------------------------------------------ CUSTOMERS (tidak diubah)
-    customers = read(d, "olist_customers_dataset.csv", dtype={"customer_zip_code_prefix": str})
+    customers = read(d, "raw_data/olist_customers_dataset.csv", dtype={"customer_zip_code_prefix": str})
 
     # ------------------------------------------------------------------ SELLERS (nama kota dibersihkan)
-    sellers = read(d, "olist_sellers_dataset.csv", dtype={"seller_zip_code_prefix": str})
+    sellers = read(d, "raw_data/olist_sellers_dataset.csv", dtype={"seller_zip_code_prefix": str})
     raw_cities = sellers["seller_city"].nunique()
     sellers = clean_seller_cities(sellers)
 
@@ -129,8 +129,8 @@ def main():
                              columns=["state_code", "state_name", "region"])
 
     # ------------------------------------------------------------------ PRODUCTS (kategori + terjemahan; dimensi & berat dibuang)
-    products = read(d, "olist_products_dataset.csv")
-    translation = read(d, "product_category_name_translation.csv")
+    products = read(d, "raw_data/olist_products_dataset.csv")
+    translation = read(d, "raw_data/product_category_name_translation.csv")
     translation.columns = [c.strip() for c in translation.columns]
     tmap = dict(zip(translation.product_category_name, translation.product_category_name_english))
     tmap.update(EXTRA_TRANSLATIONS)
@@ -140,11 +140,11 @@ def main():
     products = products[["product_id", "product_category_name", "product_category_name_english"]]
 
     # ------------------------------------------------------------------ ORDER ITEMS
-    items = read(d, "olist_order_items_dataset.csv", parse_dates=["shipping_limit_date"])
+    items = read(d, "raw_data/olist_order_items_dataset.csv", parse_dates=["shipping_limit_date"])
     items = fmt_dates(items, ["shipping_limit_date"])
 
     # ------------------------------------------------------------------ PAYMENTS
-    payments = read(d, "olist_order_payments_dataset.csv")
+    payments = read(d, "raw_data/olist_order_payments_dataset.csv")
     payments = payments[payments["payment_type"] != "not_defined"].copy()           # 3 baris (order canceled)
     payments.loc[payments["payment_installments"] == 0, "payment_installments"] = 1  # 2 baris credit card
     # voucher bernilai 0 -> NULL: SUM tidak berubah, AVG otomatis melewatinya
@@ -153,7 +153,7 @@ def main():
                  "payment_value"] = np.nan
 
     # ------------------------------------------------------------------ REVIEWS (1 ulasan per order, tanpa teks)
-    reviews = read(d, "olist_order_reviews_dataset.csv",
+    reviews = read(d, "raw_data/olist_order_reviews_dataset.csv",
                    parse_dates=["review_creation_date", "review_answer_timestamp"])
     reviews = reviews[["review_id", "order_id", "review_score",
                        "review_creation_date", "review_answer_timestamp"]]           # tanpa teks
@@ -167,7 +167,7 @@ def main():
     # ------------------------------------------------------------------ ORDERS (+ kolom turunan)
     date_cols = ["order_purchase_timestamp", "order_approved_at", "order_delivered_carrier_date",
                  "order_delivered_customer_date", "order_estimated_delivery_date"]
-    orders = read(d, "olist_orders_dataset.csv", parse_dates=date_cols)
+    orders = read(d, "raw_data/olist_orders_dataset.csv", parse_dates=date_cols)
 
     # Order tidak dihapus, cukup ditandai. Delivered = status delivered DAN tanggal sampai tercatat.
     orders["is_delivered"] = ((orders["order_status"] == "delivered")

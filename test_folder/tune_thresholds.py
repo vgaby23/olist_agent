@@ -1,6 +1,6 @@
 # run from the project root: python -m test_folder.tune_thresholds
 #
-# Helps choose MIN_MATCH and WEAK_MATCH (agent/RAG_agent.py) on the FULL Qdrant index.
+# Helps choose MIN_MATCH and WEAK_MATCH (agent/rag_agent.py) on the FULL Qdrant index.
 # It runs 20 test searches WITHOUT any score cut-off and prints the scores, so we can see
 # where real topics end and nonsense begins. Only the search is called (one embedding per
 # question), not the LLM, so it costs almost nothing.
@@ -17,7 +17,7 @@ load_dotenv()                      # must run before importing rag_core (it read
 import csv
 import os
 
-from data_preprocessing.vector_data import rag_core
+from dataset.preprocessing.vector_data import rag_core
 
 TOP_K = 10
 CSV_PATH = "data/tune_thresholds.csv"
