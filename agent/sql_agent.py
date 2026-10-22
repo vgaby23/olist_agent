@@ -1,22 +1,28 @@
 """
 sql_agent.py - SQL Agent untuk Olist E-Commerce AI Assistant.
 
-Alur kerja:
-  pertanyaan -> cek role + id (make_scope) -> LLM menulis SQL
-             -> run_query (read-only, dibatasi sesuai role lewat TEMP VIEW + authorizer)
-             -> kalau error: LLM memperbaiki SQL (maks. MAX_RETRIES kali)
-             -> LLM merangkum hasil menjadi jawaban singkat.
+Alur kerja (LangChain create_agent, sama seperti RAG agent):
+  pertanyaan -> cek role + id (make_scope) -> agent LangChain dengan satu tool: run_sql(query)
+             -> LLM menulis SQL dan memanggil run_sql
+             -> run_sql menjalankan run_query (read-only, dibatasi sesuai role lewat TEMP VIEW + authorizer)
+             -> kalau error: pesan error kembali ke LLM, LLM memperbaiki SQL (maks. MAX_RETRIES kali)
+             -> LLM menulis jawaban singkat dari hasil query.
 
 Catatan:
   - role ditegakkan di kode (sql_tools.make_scope / run_query(scope=...)), bukan hanya di prompt
+  - tool run_sql dibuat per panggilan (closure) dengan scope terkunci; LLM hanya bisa mengisi SQL-nya
   - tool untuk supervisor dibuat per sesi login lewat make_data_tools(role, user_id); LLM tidak bisa memilih role
   - periode default 2017-01..2018-08; data di luar periode itu parsial; 2018 hanya Januari-Agustus
   - label kategori kosong = 'uncategorized'; view category_stats untuk pembanding se-platform
 """
 import os
 import re
+import threading
+from typing import Annotated
 
-from langchain_core.tools import tool
+from langchain.agents import create_agent
+from langchain_core.tools import InjectedToolCallId, tool
+from langgraph.errors import GraphRecursionError
 
 from data_preprocessing.numeric_data.sql_tools import get_schema, make_scope, run_query
 
@@ -29,7 +35,9 @@ except ImportError:                      # sementara file itu belum ada: biarkan
 # Aksara non-Latin (Ibrani, Arab, Thai, Cyrillic, CJK, dst.) yang tidak boleh muncul di jawaban
 FOREIGN_SCRIPT = re.compile(r"[Ѐ-ӿ֐-ۿऀ-ॿ฀-๿぀-ヿ一-鿿가-힯]")
 
-MAX_RETRIES = 2
+MAX_RETRIES = 2          # berapa kali LLM boleh memperbaiki SQL yang gagal
+MAX_QUERIES = 4          # batas total query per pertanyaan (agent boleh memecah pertanyaan jadi beberapa query)
+RECURSION_LIMIT = 20     # pengaman langkah agent LangChain (tiap panggilan LLM / tool = 1 langkah)
 
 # Hanya dipakai kalau jawabannya dalam Bahasa Indonesia
 INDONESIAN_TERMS = ("- Payment types: write credit_card as 'kartu kredit', debit_card as 'kartu debit', "
@@ -37,7 +45,9 @@ INDONESIAN_TERMS = ("- Payment types: write credit_card as 'kartu kredit', debit
 
 RULES = """
 You are an expert SQLite analyst for the Olist Brazilian e-commerce database.
-Write ONE read-only SQLite query (SELECT or WITH ... SELECT) that answers the user's question.
+Answer the user's question with data: write a read-only SQLite query (SELECT or WITH ... SELECT), run it with
+the run_sql tool, then answer from the result. Prefer ONE query; use a second one only if the question really
+needs it. If run_sql returns an ERROR, fix the query and call run_sql again.
 
 DATABASE SCHEMA:
 {schema}
@@ -65,6 +75,8 @@ BUSINESS RULES (follow them strictly):
    product, category or seller level scores first take ONE row per order in a CTE:
    SELECT DISTINCT oi.order_id, <product_id / category / seller_id>, r.review_score, then COUNT(*) / AVG over it.
    Never AVG or COUNT review_score directly over an order_items join.
+   Review scores and review counts ALWAYS use delivered orders only: JOIN orders and filter orders.is_delivered = 1
+   (canceled or undelivered orders are not part of the rating), together with the period filter from rule 2.
 6. On-time delivery: orders.is_late is 1 (late) or 0 (on time) for delivered orders, NULL otherwise.
    On-time rate = 1 - AVG(is_late) over orders with is_delivered = 1. Delivery time = orders.delivery_days.
 7. Payments: order_payments can have several rows per order. NEVER SUM values after joining order_items
@@ -86,10 +98,29 @@ BUSINESS RULES (follow them strictly):
 16. category_stats is a ready-made, platform-wide summary per product category (all sellers). Use it for
     market or competitor comparisons by category (most-loved categories on the platform, average price, items sold).
 
-OUTPUT FORMAT:
-- Return ONLY the SQL query, no explanation, no markdown fences.
+WHEN THE DATABASE CANNOT ANSWER:
 - If the question cannot be answered with this database (for example profit, product name, seller name),
-  return exactly: CANNOT_ANSWER: <short reason in English>
+  do NOT call run_sql: politely say so in one or two short sentences and do not invent any data.
+""".strip()
+
+# Aturan menulis jawaban akhir (dulu prompt ringkasan terpisah; sekarang bagian dari system prompt agent)
+ANSWER_RULES = """
+WRITING THE ANSWER (after run_sql returned a result):
+- Answer the user's question using ONLY the query result. Do not invent numbers. If the result is empty, say
+  that no data was found.
+- Write the whole answer in {language} only. Do not mix in any other language and do not use any non-Latin
+  writing system.
+- Be concise. Do not mention column names, table names or SQL.
+- All money values are in Brazilian Real; write them as R$ with the usual number format of the answer
+  language (Indonesian/Portuguese: 1.234,56; English: 1,234.56). Do not convert currencies.
+- Sellers are identified by seller_id only (no names).
+- Copy every id (seller_id, order_id, product_id, customer_unique_id) in FULL, exactly as in the result.
+  Never shorten an id.
+- Copy city names and state names EXACTLY as they appear in the result (same spelling; you may only capitalise
+  them). Never replace them with a similar-looking name.
+- Copy category names EXACTLY as in the result, underscores included and NOT capitalised: write health_beauty,
+  never "Health & Beauty" or "Health Beauty" (other agents search with these exact names).
+- Follow the NOTES FOR THE ANSWER that run_sql returns with each result (period covered, truncated rows).
 """.strip()
 
 
@@ -141,8 +172,19 @@ def make_role_note(scope):
     if scope.role == "customer":
         return (f"The user is the customer {scope.user_id}. The tables customers, orders, order_items, "
                 "order_payments, order_reviews and sellers ALREADY contain only this customer's own data, so "
-                "'my', 'me', 'I', 'saya' simply mean all rows. Other customers' data is not available.")
+                "'my', 'me', 'I', 'saya' simply mean all rows. Do NOT filter on this id yourself (it is a "
+                "customer_unique_id, not a customer_id): just query the tables. Other customers' data is not available.")
     return "The user is a company (platform) employee and can see all data."
+
+
+PERIOD_FILTER = re.compile(r"in_trend_period|purchase_month|purchase_year|order_purchase_timestamp")
+ORDER_TABLES = re.compile(r"\b(orders|order_items|order_payments|order_reviews)\b")
+
+
+def missing_period(sql):
+    """True kalau SQL membaca tabel order tapi tidak punya filter periode sama sekali (aturan 2 terlewat)."""
+    lowered = sql.lower()
+    return bool(ORDER_TABLES.search(lowered)) and not PERIOD_FILTER.search(lowered)
 
 
 def period_note(sql):
@@ -151,7 +193,7 @@ def period_note(sql):
     if "in_trend_period" in lowered:
         note = ("- The numbers cover January 2017 to August 2018 (the default analysis period); say so briefly. "
                 "If years are compared or a 2018 total is given, mention that 2018 only contains January to August.")
-    elif re.search(r"purchase_month|purchase_year|order_purchase_timestamp", lowered):
+    elif PERIOD_FILTER.search(lowered):
         note = ("- The query filters on the period the user asked for. If that period includes months before "
                 "2017-01 or after 2018-08, say the data for those months is partial. If years are compared or a "
                 "2018 total is given, mention that 2018 only contains January to August.")
@@ -168,16 +210,85 @@ def _say(llm, language, message, question):
     return _text(llm.invoke([("human", prompt)]))
 
 
+def format_result(data, sql):
+    """Hasil query sebagai teks untuk LLM: tabel + catatan untuk jawaban (periode, baris terpotong)."""
+    table = data.to_string(index=False) if not data.empty else "(no rows returned)"
+    notes = period_note(sql)
+    if data.attrs.get("truncated"):
+        notes += f"- Only the first {len(data)} rows are shown; the full result has more. Tell the user.\n"
+    if missing_period(sql):     # LLM sering lupa aturan 2: ingatkan di hasil, bukan hanya di system prompt
+        notes += ("- CHECK RULE 2: this query has no period filter. If the user did NOT name a period, run the "
+                  "query again with JOIN orders ... AND orders.in_trend_period = 1, and answer from that result.\n")
+    return f"{table}\n\nNOTES FOR THE ANSWER:\n{notes}"
+
+
+def make_sql_tool(scope, state, verbose=False):
+    """Tool run_sql untuk SATU pertanyaan. scope dikunci di sini (closure): LLM hanya mengisi SQL-nya.
+    state (dict) mencatat semua query (state["runs"]: {"call_id", "sql", "data", "error"}), error terakhir, dan
+    jumlah percobaan. LLM bisa memanggil run_sql beberapa kali SEKALIGUS (LangChain menjalankannya di thread
+    terpisah, urutan mulainya acak), jadi penghitung dijaga dengan lock dan tiap run menyimpan tool_call_id-nya
+    supaya ask_sql_agent bisa mengurutkannya sesuai urutan panggilan LLM."""
+    lock = threading.Lock()
+
+    @tool
+    def run_sql(query: str, tool_call_id: Annotated[str, InjectedToolCallId]) -> str:
+        """Run ONE read-only SQLite query (SELECT or WITH ... SELECT) on the Olist database and return the result
+        table, or an ERROR message to fix. The data is already limited to what the logged-in user may see.
+
+        Arguments:
+            query: the SQL query only, no explanation and no markdown fences.
+        """
+        sql = _clean_sql(query)
+        with lock:
+            if state["failed"] > MAX_RETRIES or state["queries"] >= MAX_QUERIES:
+                return "STOP: no more queries allowed for this question. Do not call run_sql again; answer now."
+            state["queries"] += 1
+            number = state["queries"]
+            run = {"call_id": tool_call_id, "sql": sql, "data": None, "error": None}
+            state["runs"].append(run)
+        if verbose:
+            print(f"[Percobaan {number}] SQL:\n{sql}\n")
+        try:
+            data = run_query(sql, scope=scope)
+        except Exception as e:  # SQL salah / ditolak -> pesan error kembali ke LLM supaya diperbaiki
+            run["error"] = f"{type(e).__name__}: {e}"
+            with lock:
+                state["failed"] += 1
+                state["error"] = run["error"]
+            if verbose:
+                print(f"   -> Error: {run['error']}\n")
+            return f"ERROR: {run['error']}\nFix the query and call run_sql again."
+
+        run["data"] = data
+        with lock:
+            state["error"] = None
+        return format_result(data, sql)
+
+    return run_sql
+
+
+def build_sql_agent(llm, scope, language, state, verbose=False):
+    """Satukan LLM, tool run_sql dan instruksi menjadi agent LangChain (dibuat ulang per pertanyaan,
+    karena scope dan bahasa jawaban berbeda per login / pertanyaan)."""
+    system_prompt = "\n\n".join([
+        RULES.format(schema=get_schema()),
+        ANSWER_RULES.format(language=language) + ("\n" + INDONESIAN_TERMS if "indones" in language.lower() else ""),
+    ])
+    return create_agent(llm, [make_sql_tool(scope, state, verbose)], system_prompt=system_prompt, name="sql_agent")
+
+
 def ask_sql_agent(question, role="company", llm=None, verbose=True, language=None, user_id=None):
     """
     Jawab pertanyaan berbasis data. Mengembalikan dict:
-      {"question", "role", "sql", "data" (DataFrame atau None), "answer", "error"}
+      {"question", "role", "sql", "data" (DataFrame atau None), "results", "answer", "error"}
+    sql/data = query TERAKHIR yang berhasil (urutan panggilan); results = SEMUA query yang berhasil,
+    [{"sql", "data"}, ...], untuk pertanyaan yang dipecah jadi beberapa query.
     user_id: seller_id (role "seller") atau customer_unique_id (role "customer") dari halaman login.
              Wajib untuk seller dan customer; tanpa id yang valid agent menolak menjawab.
     """
     llm = llm or get_llm()
     language = pick_language(question, language)
-    result = {"question": question, "role": role, "sql": None, "data": None, "error": None}
+    result = {"question": question, "role": role, "sql": None, "data": None, "results": [], "error": None}
 
     try:
         scope = make_scope(role, user_id)      # role ditegakkan di kode
@@ -186,66 +297,39 @@ def ask_sql_agent(question, role="company", llm=None, verbose=True, language=Non
         result["answer"] = _say(llm, language, f"the login is incomplete ({error})", question)
         return result
 
-    messages = [("system", RULES.format(schema=get_schema())),
-                ("human", f"{make_role_note(scope)}\nQuestion: {question}")]
-    sql, data, error = None, None, None
+    state = {"runs": [], "error": None, "queries": 0, "failed": 0}
+    agent = build_sql_agent(llm, scope, language, state, verbose)
+    # catatan role tepat di samping pertanyaan (seperti versi lama): kalau ditaruh di system prompt, LLM
+    # cenderung menambah filter id sendiri (mis. customer_id = <customer_unique_id>) dan hasilnya kosong
+    message = f"{make_role_note(scope)}\nQuestion: {question}"
+    try:
+        output = agent.invoke({"messages": [{"role": "user", "content": message}]},
+                              config={"recursion_limit": RECURSION_LIMIT})
+        answer = _text(output["messages"][-1])
+        # urutkan run sesuai urutan tool call di pesan LLM (bukan urutan selesainya thread)
+        call_order = [call["id"] for msg in output["messages"] for call in getattr(msg, "tool_calls", None) or []]
+        state["runs"].sort(key=lambda run: call_order.index(run["call_id"]) if run["call_id"] in call_order
+                           else len(call_order))
+    except GraphRecursionError:
+        state["error"] = state["error"] or "the agent needed too many steps"
+        answer = None
 
-    for attempt in range(MAX_RETRIES + 1):
-        reply = _clean_sql(_text(llm.invoke(messages)))
-
-        if reply.upper().startswith("CANNOT_ANSWER"):
-            result["answer"] = _say(llm, language, reply.split(":", 1)[-1].strip(), question)
-            return result
-
-        sql = reply
-        if verbose:
-            print(f"[Percobaan {attempt + 1}] SQL:\n{sql}\n")
-        try:
-            data = run_query(sql, scope=scope)
-            error = None
-            break
-        except Exception as e:  # SQL salah / ditolak -> minta LLM memperbaiki
-            error = f"{type(e).__name__}: {e}"
-            data = None
-            if verbose:
-                print(f"   -> Error: {error}\n")
-            messages += [("ai", reply),
-                         ("human", f"That query failed with this error: {error}\n"
-                                   "Fix it and return ONLY the corrected SQL query.")]
-
-    result["sql"] = sql
-    if error:
-        result["error"] = error
+    succeeded = [{"sql": run["sql"], "data": run["data"]} for run in state["runs"] if run["data"] is not None]
+    result["results"] = succeeded
+    if succeeded:
+        result.update(sql=succeeded[-1]["sql"], data=succeeded[-1]["data"])
+    elif state["runs"]:
+        result["sql"] = state["runs"][-1]["sql"]
+    if not succeeded and state["error"]:           # tidak ada satu pun query yang berhasil
+        result["error"] = state["error"]
         result["answer"] = "Sorry, I could not build a valid database query for this question."
         return result
 
-    # Ringkas hasil menjadi jawaban untuk pengguna
-    table = data.to_string(index=False) if not data.empty else "(no rows returned)"
-    if data.attrs.get("truncated"):
-        table += f"\n(Only the first {len(data)} rows are shown; the full result has more. Tell the user.)"
-    summary_prompt = (
-        "You are a helpful e-commerce data assistant. Answer the user's question using ONLY the query result below.\n"
-        f"- Write the whole answer in {language} only. Do not mix in any other language and do not use any "
-        "non-Latin writing system.\n"
-        "- Be concise. Do not mention column names, table names or SQL.\n"
-        "- All money values are in Brazilian Real; write them as R$ with the usual number format of the answer "
-        "language (Indonesian/Portuguese: 1.234,56; English: 1,234.56). Do not convert currencies.\n"
-        "- Do not invent numbers. If the result is empty, say that no data was found.\n"
-        "- Sellers are identified by seller_id only (no names).\n"
-        "- Copy every id (seller_id, order_id, product_id, customer_unique_id) in FULL, exactly as in the result. "
-        "Never shorten an id.\n"
-        "- Copy city names, state names and category names EXACTLY as they appear in the result "
-        "(same spelling; you may only capitalise them). Never replace them with a similar-looking name.\n"
-        f"{period_note(sql)}"
-        f"{INDONESIAN_TERMS if 'indones' in language.lower() else ''}\n"
-        f"Question: {question}\n\nSQL used:\n{sql}\n\nQuery result:\n{table}"
-    )
-    answer = _text(llm.invoke([("human", summary_prompt)]))
-    if FOREIGN_SCRIPT.search(answer):  # jaga-jaga: minta ulang sekali, lalu bersihkan kalau masih ada
-        answer = _text(llm.invoke([("human", summary_prompt + f"\n\nYour previous answer contained foreign "
-                                    f"characters. Rewrite it in plain {language} using only Latin letters.")]))
+    if answer and FOREIGN_SCRIPT.search(answer):   # jaga-jaga: minta ulang sekali, lalu bersihkan kalau masih ada
+        answer = _text(llm.invoke([("human", f"Rewrite this answer in plain {language} using only Latin letters. "
+                                    f"Keep every number and id exactly as it is.\n\n{answer}")]))
         answer = FOREIGN_SCRIPT.sub("", answer)
-    result.update(sql=sql, data=data, answer=answer)
+    result["answer"] = answer or "Sorry, I could not answer this question."
     return result
 
 
@@ -276,15 +360,31 @@ def get_customer_categories(scope, limit=3):
     return run_query(sql, scope=scope)
 
 
+# Halaman login hanya memilih role + password (tanpa id), jadi seller dan customer memakai SATU akun demo
+# per role. Id-nya dari .env (bisa diganti tanpa mengubah kode); default = akun yang sudah dicek ada datanya.
+DEMO_USER_IDS = {
+    "seller": os.getenv("DEMO_SELLER_ID", "d91fb3b7d041e83b64a00a3edfb37e4f"),         # 535 order
+    "customer": os.getenv("DEMO_CUSTOMER_ID", "02e9109b7e0a985108b43e573b6afb23"),     # 3 order terkirim
+}
+
+
+def demo_user_id(role):
+    """Id akun demo untuk role ini (None untuk company). Dipakai supervisor juga, misalnya untuk menulis
+    seller_id ke pertanyaan RAG agent ("review toko saya")."""
+    return DEMO_USER_IDS.get((role or "").strip().lower())
+
+
 def make_data_tools(role, user_id=None):
-    """Buat tool data untuk SATU sesi login. role dan user_id diambil dari halaman login, bukan dari LLM.
+    """Buat tool data untuk SATU sesi login. role (dan user_id) diambil dari halaman login, bukan dari LLM.
+    Tanpa user_id, seller/customer memakai akun demo role itu (demo_user_id).
 
     Mengembalikan list tool untuk supervisor:
       - ask_data_agent(question)              -> semua role
       - customer_past_categories()            -> hanya role customer (riwayat kategori miliknya sendiri)
-    Raise ValueError kalau login tidak valid (misalnya seller tanpa seller_id), supaya aplikasi menolak sejak awal.
+    Raise ValueError kalau login tidak valid (role tidak dikenal, id demo tidak ada di database), supaya aplikasi
+    menolak sejak awal.
     """
-    scope = make_scope(role, user_id)
+    scope = make_scope(role, user_id or demo_user_id(role))
 
     @tool
     def ask_data_agent(question: str) -> str:

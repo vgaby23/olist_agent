@@ -8,7 +8,6 @@ Jalankan dari folder utama proyek:
     python -m data_preprocessing.numeric_data.test_sql_security
 """
 import inspect
-from types import SimpleNamespace
 
 from data_preprocessing.numeric_data.sql_tools import get_monthly_revenue, make_scope, run_query, validate_query
 
@@ -145,27 +144,60 @@ try:
 except ImportError as error:
     print(f"[SKIP] tes agent: {error}")
 else:
-    class FakeLLM:
-        """Mengembalikan jawaban berurutan; mencatat prompt yang diterima."""
-        def __init__(self, replies):
-            self.replies, self.prompts = list(replies), []
+    from langchain_core.language_models import BaseChatModel
+    from langchain_core.messages import AIMessage, ToolMessage
+    from langchain_core.outputs import ChatGeneration, ChatResult
+    from pydantic import Field
 
-        def invoke(self, messages):
+    class FakeLLM(BaseChatModel):
+        """Chat model palsu untuk agent LangChain: mengembalikan jawaban berurutan dan mencatat prompt yang
+        diterima. Jawaban berupa teks biasa, atau AIMessage dengan tool_calls (lihat sql_call)."""
+        replies: list
+        prompts: list = Field(default_factory=list)
+
+        @property
+        def _llm_type(self):
+            return "fake"
+
+        def bind_tools(self, tools, **kwargs):
+            return self
+
+        def _generate(self, messages, stop=None, run_manager=None, **kwargs):
             self.prompts.append(messages)
-            return SimpleNamespace(content=self.replies.pop(0))
+            reply = self.replies.pop(0)
+            message = reply if isinstance(reply, AIMessage) else AIMessage(content=reply)
+            return ChatResult(generations=[ChatGeneration(message=message)])
 
-    llm = FakeLLM(["SELECT ROUND(SUM(oi.price),2) AS revenue FROM order_items oi "
-                   "JOIN orders o ON o.order_id = oi.order_id WHERE o.is_delivered = 1",
-                   "Total pendapatan: R$ 226.987,93"])
+    call_ids = iter(range(1000))
+
+    def sql_call(sql):
+        """Balasan LLM yang memanggil tool run_sql dengan SQL ini (id tool call harus unik)."""
+        return AIMessage(content="", tool_calls=[{"name": "run_sql", "args": {"query": sql}, "id": f"call_{next(call_ids)}"}])
+
+    llm = FakeLLM(replies=[sql_call("SELECT ROUND(SUM(oi.price),2) AS revenue FROM order_items oi "
+                                    "JOIN orders o ON o.order_id = oi.order_id WHERE o.is_delivered = 1"),
+                           "Total pendapatan: R$ 226.987,93"])
     out = ask_sql_agent("Berapa total pendapatan semua seller?", role="seller", user_id=SELLER,
                         llm=llm, verbose=False, language="Indonesian")
     check("agent: SQL LLM dijalankan dengan scope seller", out["data"].iloc[0, 0] == 226987.93)
+    check("agent: jawaban akhir dari LLM", out["answer"] == "Total pendapatan: R$ 226.987,93")
 
-    llm = FakeLLM(['SELECT COUNT(*) FROM "main"."order_items"', "SELECT COUNT(*) FROM order_items", "ok"])
+    llm = FakeLLM(replies=[sql_call('SELECT COUNT(*) FROM "main"."order_items"'),
+                           sql_call("SELECT COUNT(*) FROM order_items"), "ok"])
     out = ask_sql_agent("count items", role="seller", user_id=SELLER, llm=llm, verbose=False, language="English")
     check("agent: SQL bypass ditolak lalu diperbaiki LLM", out["data"].iloc[0, 0] < 112650 and out["error"] is None)
 
-    llm = FakeLLM(["You need to log in as a seller first."])
+    llm = FakeLLM(replies=[sql_call("SELECT nope FROM nowhere") for _ in range(3)] + ["I could not do it."])
+    out = ask_sql_agent("broken", llm=llm, verbose=False, language="English")
+    check("agent: berhenti setelah 3 SQL gagal", out["error"] and out["data"] is None and not llm.replies,
+          out["error"])
+
+    llm = FakeLLM(replies=["Sorry, the database has no profit data."])
+    out = ask_sql_agent("What is my profit?", llm=llm, verbose=False, language="English")
+    check("agent: pertanyaan di luar database -> jawab tanpa SQL", out["sql"] is None and out["error"] is None
+          and "profit" in out["answer"])
+
+    llm = FakeLLM(replies=["You need to log in as a seller first."])
     out = ask_sql_agent("my revenue?", role="seller", llm=llm, verbose=False, language="English")
     check("agent: seller tanpa id -> menolak tanpa menjalankan SQL", out["sql"] is None and out["error"])
 
@@ -177,13 +209,15 @@ else:
     check("periode: SQL dengan periode dari pengguna -> catatan parsial",
           "partial" in period_note("... WHERE o.purchase_year = 2016"))
 
-    llm = FakeLLM(["SELECT s.seller_city, ROUND(SUM(oi.price),2) AS revenue FROM order_items oi "
-                   "JOIN sellers s ON s.seller_id = oi.seller_id GROUP BY 1 ORDER BY 2 DESC LIMIT 3", "ok"])
+    llm = FakeLLM(replies=[sql_call("SELECT s.seller_city, ROUND(SUM(oi.price),2) AS revenue FROM order_items oi "
+                                    "JOIN sellers s ON s.seller_id = oi.seller_id GROUP BY 1 ORDER BY 2 DESC LIMIT 3"),
+                           "ok"])
     ask_sql_agent("Top 3 seller cities by revenue?", llm=llm, verbose=False, language="English")
-    summary = llm.prompts[-1][0][1]
-    check("agent: ringkasan tanpa filter periode tidak mengklaim 2017-2018",
-          "all available data" in summary and "January 2017 to August 2018 (the default" not in summary)
-    check("agent: ringkasan meminta nama kota disalin persis", "EXACTLY" in summary)
+    last_prompt = llm.prompts[-1]               # prompt saat LLM menulis jawaban akhir
+    tool_result = next(m.content for m in last_prompt if isinstance(m, ToolMessage))
+    check("agent: hasil tanpa filter periode tidak mengklaim 2017-2018",
+          "all available data" in tool_result and "January 2017 to August 2018 (the default" not in tool_result)
+    check("agent: instruksi meminta nama kota disalin persis", "EXACTLY" in last_prompt[0].content)
 
     # tool per sesi login: role & id dikunci, LLM hanya mengisi pertanyaan
     def tool_name(t):
