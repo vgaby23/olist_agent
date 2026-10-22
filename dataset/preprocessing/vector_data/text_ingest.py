@@ -32,8 +32,8 @@ from dotenv import load_dotenv
 # This MUST run before the two imports below: they read these variables the moment they are imported.
 load_dotenv()
 
-from Data_Preprocessing.Vector_Data import text_combinedata
-from Data_Preprocessing.Vector_Data import text_vectordb
+from dataset.preprocessing.vector_data import text_combinedata
+from dataset.preprocessing.vector_data import text_vectordb
 
 # The agent's image step needs the list of valid category names. We save it here.
 CATEGORIES_FILE = os.environ.get("CATEGORIES_FILE", "categories.json")

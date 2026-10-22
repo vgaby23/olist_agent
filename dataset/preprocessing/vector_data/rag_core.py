@@ -33,7 +33,7 @@ import os
 
 from qdrant_client import models
 
-from Data_Preprocessing.Vector_Data import text_vectordb as vectordb
+from dataset.preprocessing.vector_data import text_vectordb as vectordb
 
 # The most reviews one request may ask for. app.py uses it to reject something like top_k=100000.
 MAX_TOP_K = int(os.environ.get("MAX_TOP_K", "50"))
