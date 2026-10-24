@@ -8,15 +8,22 @@ WHAT IT DOES
     answer with example quotes. It does NOT do numbers (counts, averages): that is the SQL agent's job.
 
 HOW THE SUPERVISOR USES IT   (note for the teammate who builds the supervisor)
-    The simplest way, one line - the agent is already wrapped as a tool:
+    The simplest way: make the tool for the login session (role from the login page, like make_data_tools
+    in sql_agent.py). The role is locked inside the tool, so the supervisor's LLM cannot change it:
 
-        from rag_agent import ask_review_agent
-        supervisor = create_agent(llm, [ask_review_agent, <the SQL agent tool>], system_prompt=...)
+        from agent.RAG_agent import make_review_tools
+        tools = make_review_tools(role, user_id) + make_data_tools(role, user_id)
+        supervisor = create_agent(llm, tools, system_prompt=...)
 
     Or call it as a normal function (question in, text out, no memory between calls):
 
-        from rag_agent import ask_rag_agent
-        text = ask_rag_agent("What do customers complain about in health_beauty?")
+        from agent.RAG_agent import ask_rag_agent
+        text = ask_rag_agent("What do customers complain about in health_beauty?", role="customer")
+
+    WHO SEES WHAT (enforced in code, see Part 2)
+      * company:  all reviews.
+      * seller:   only the reviews of their own orders (seller_id is always forced to theirs).
+      * customer: only the reviews of their own orders.
 
     Rules for the supervisor:
       * Send a COMPLETE question. This agent does not see the conversation, so write the category,
@@ -26,8 +33,8 @@ HOW THE SUPERVISOR USES IT   (note for the teammate who builds the supervisor)
         into that language. Without a hint, the agent uses the language of the question you send it.
       * To get the review of ONE order (e.g. after the SQL agent found its order_id), put the order_id in the
         question: "What did order <order_id> say?". Price limits ("above 150 BRL") also work as filters.
-      * For a SELLER user, put their seller_id in the question: "Why do customers of seller <seller_id> give
-        low ratings?". The same works for one product: "What do reviews of product <product_id> say?".
+      * A SELLER user's reviews are already limited to their shop, so "Why do my customers give low ratings?"
+        is enough. For one product: "What do reviews of product <product_id> say?".
       * The answer is plain text: a summary plus example quotes, each with its rating, product category, seller city
         and order_id.
         order_id links to the SQL tables, so the SQL agent can look up more about that order.
@@ -44,12 +51,14 @@ TRY IT
     python rag_agent.py                                  chat in the terminal, "exit" to stop
     python rag_agent.py "why do people give 1 star?"     one question
     python rag_agent.py --show-steps                     also print every search the agent runs
+    python rag_agent.py --role seller                    as the demo seller (or --user-id <id>)
 
-THE FILE HAS 4 PARTS
+THE FILE HAS 5 PARTS
     1. Settings and finding your files
-    2. The search tool
-    3. The agent (instructions + build_rag_agent)
-    4. Ways to use it: ask_rag_agent, ask_review_agent (for the supervisor), chat, main
+    2. Who may see which reviews (role scope)
+    3. The search tool
+    4. The agent (instructions + build_rag_agent)
+    5. Ways to use it: ask_rag_agent, make_review_tools (for the supervisor), chat, main
 """
 import json
 import os
@@ -95,6 +104,8 @@ def is_general_query(query):
 THIS_FOLDER = Path(__file__).resolve().parent
 
 from agent.language import guess_language
+from agent.sql_agent import demo_user_id
+from data_preprocessing.numeric_data.sql_tools import Scope, make_scope, run_query
 from data_preprocessing.vector_data import rag_core
 
 def add_language_hint(question):
@@ -180,190 +191,251 @@ def format_categories(names):
 
 
 # =============================================================================
-# Part 2: THE SEARCH TOOL
+# Part 2: WHO MAY SEE WHICH REVIEWS (role scope)
+# =============================================================================
+# The same roles as the SQL agent (sql_tools.make_scope). The rules are enforced HERE in code, on the
+# filters, not only in the prompt: a prompt can be talked around ("I am actually staff"), code cannot.
+#   company   all reviews, every filter.
+#   seller    only reviews of their OWN orders: seller_id is always forced to their id.
+#   customer  only the reviews of their OWN orders: order_id is always forced to their order_ids, and asking
+#             for another order or for one chosen seller (seller_id) is refused.
+
+
+def own_order_ids(scope):
+    """The order_ids of the logged-in customer (read through the customer scope of sql_tools)."""
+    data = run_query("SELECT order_id FROM orders", scope=scope, max_rows=1000)
+    return set(data["order_id"])
+
+
+def apply_scope(filters, scope):
+    """Lock the filters to what the logged-in user may see.
+    Returns (filters, None), or (None, "reason") when the search is not allowed for this role."""
+    if scope.role == "seller":
+        asked = filters.get("seller_id")
+        if asked and asked.lower() != scope.user_id:
+            return None, ("NOT ALLOWED: a seller can only read the reviews of their own shop, not of another "
+                          "seller. Tell the user this politely and do not search again for that seller.")
+        return {**filters, "seller_id": scope.user_id}, None
+
+    if scope.role == "customer":
+        if filters.get("seller_id"):
+            return None, ("NOT ALLOWED: customers cannot filter reviews by one specific seller. Tell the user "
+                          "this politely: they can only read the reviews of their own orders.")
+        own = own_order_ids(scope)
+        asked = filters.get("order_id")
+        if asked:
+            asked = asked if isinstance(asked, list) else [asked]
+            if not set(asked) <= own:
+                return None, ("NOT ALLOWED: a customer can only look up the reviews of their OWN orders. Tell the "
+                              "user this politely and do not search again for those orders.")
+            return filters, None
+        if not own:
+            return None, "This customer has no orders, so there are no reviews to show. Tell the user so."
+        return {**filters, "order_id": sorted(own)}, None
+    return filters, None
+
+
+# =============================================================================
+# Part 3: THE SEARCH TOOL
 # =============================================================================
 # The @tool line turns a normal Python function into something the LLM can call.
 # IMPORTANT: the LLM never sees our code. It only sees the function NAME, the argument names and
 # the text inside the triple quotes (the "docstring"). So the docstring is an instruction manual
 # written for the LLM. Vague docstring = tool used badly.
-@tool
-def search_reviews(
-    query: str,
-    answer_language: str,
-    how_many: int = 5,
-    max_rating: int | None = None,
-    min_rating: int | None = None,
-    product_category: str | None = None,
-    seller_id: str | None = None,
-    product_id: str | None = None,
-    seller_city: str | None = None,
-    order_id: str | None = None,
-    order_ids: list[str] | None = None,
-    min_price: float | None = None,
-    max_price: float | None = None,
-    must_contain: str | None = None,
-) -> str:
-    """Search customer review comments by MEANING and return the best matches.
+#
+# The tool is made per login (like run_sql in sql_agent.py): the scope is locked inside it, so the LLM can
+# only fill in the search arguments, never the role.
+def make_search_tool(scope):
+    @tool
+    def search_reviews(
+        query: str,
+        answer_language: str,
+        how_many: int = 5,
+        max_rating: int | None = None,
+        min_rating: int | None = None,
+        product_category: str | None = None,
+        seller_id: str | None = None,
+        product_id: str | None = None,
+        seller_city: str | None = None,
+        order_id: str | None = None,
+        order_ids: list[str] | None = None,
+        min_price: float | None = None,
+        max_price: float | None = None,
+        must_contain: str | None = None,
+    ) -> str:
+        """Search customer review comments by MEANING and return the best matches.
 
-    Use this to find out what customers say: complaints, praise, reasons for a bad rating,
-    opinions about a product type.
+        Use this to find out what customers say: complaints, praise, reasons for a bad rating,
+        opinions about a product type. The reviews are already limited to what the logged-in user may see.
 
-    The reviews are written in Portuguese, so write the query in Portuguese (it matches much better).
+        The reviews are written in Portuguese, so write the query in Portuguese (it matches much better).
 
-    Arguments:
-        query: what to look for, in Portuguese, e.g. "atraso na entrega" or "produto quebrado".
-        answer_language: the language the USER wrote in (or asked for), e.g. "English", "Bahasa Indonesia"
-            or "Portuguese". Decide this first. The tool reminds you of it when it returns the reviews.
-        how_many: number of reviews to return, 1 to 10 (default 5).
-        max_rating: only reviews with this rating or lower (1 = worst, 5 = best). Use 2 for complaints.
-        min_rating: only reviews with this rating or higher. Use 4 for praise.
-        product_category: only reviews of orders that contain this ENGLISH category, e.g. "health_beauty".
-        seller_city: only reviews of orders from sellers in this city, e.g. "sao paulo".
-        order_id: the review of ONE specific order (the long id). Use it with a general query like "avaliação".
-        order_ids: the reviews of SEVERAL orders (up to 50 long ids, e.g. the order_ids the data agent found for a month). Use it with a general query like "avaliação", or a topic like "atraso na entrega".
-        seller_id: only reviews of orders from ONE seller (the long seller id, copied exactly). Use it when the question is about a specific seller or shop. With no other topic, use a general query like "reclamação".
-        product_id: only reviews of orders that contain ONE specific product (the long product id, copied exactly).
-        min_price: only orders with an item that costs at least this many Brazilian reais (BRL).
-        max_price: only orders with an item that costs at most this many reais (BRL).
-        must_contain: a regular expression the review text must match (case-insensitive). Use it when the user
-            wants reviews that contain something specific, e.g. "[0-9]{1,2}/[0-9]{1,2}" for a date or
-            "sedex|correios" for words. Only the 50 closest reviews are checked.
-    """
-    # 1) Turn the simple arguments into the filter dictionary that rag_core.search understands.
-    filters = {}
+        Arguments:
+            query: what to look for, in Portuguese, e.g. "atraso na entrega" or "produto quebrado".
+            answer_language: the language the USER wrote in (or asked for), e.g. "English", "Bahasa Indonesia"
+                or "Portuguese". Decide this first. The tool reminds you of it when it returns the reviews.
+            how_many: number of reviews to return, 1 to 10 (default 5).
+            max_rating: only reviews with this rating or lower (1 = worst, 5 = best). Use 2 for complaints.
+            min_rating: only reviews with this rating or higher. Use 4 for praise.
+            product_category: only reviews of orders that contain this ENGLISH category, e.g. "health_beauty".
+            seller_city: only reviews of orders from sellers in this city, e.g. "sao paulo".
+            order_id: the review of ONE specific order (the long id). Use it with a general query like "avaliação".
+            order_ids: the reviews of SEVERAL orders (up to 50 long ids, e.g. the order_ids the data agent found for a month). Use it with a general query like "avaliação", or a topic like "atraso na entrega".
+            seller_id: only reviews of orders from ONE seller (the long seller id, copied exactly). Use it when the question is about a specific seller or shop. With no other topic, use a general query like "reclamação".
+            product_id: only reviews of orders that contain ONE specific product (the long product id, copied exactly).
+            min_price: only orders with an item that costs at least this many Brazilian reais (BRL).
+            max_price: only orders with an item that costs at most this many reais (BRL).
+            must_contain: a regular expression the review text must match (case-insensitive). Use it when the user
+                wants reviews that contain something specific, e.g. "[0-9]{1,2}/[0-9]{1,2}" for a date or
+                "sedex|correios" for words. Only the 50 closest reviews are checked.
+        """
+        # 1) Turn the simple arguments into the filter dictionary that rag_core.search understands.
+        filters = {}
 
-    rating_range = {}
-    if min_rating is not None:
-        rating_range["gte"] = min_rating          # gte = greater than or equal
-    if max_rating is not None:
-        rating_range["lte"] = max_rating          # lte = less than or equal
-    if rating_range:
-        filters["review_score"] = rating_range
+        rating_range = {}
+        if min_rating is not None:
+            rating_range["gte"] = min_rating          # gte = greater than or equal
+        if max_rating is not None:
+            rating_range["lte"] = max_rating          # lte = less than or equal
+        if rating_range:
+            filters["review_score"] = rating_range
 
-    if product_category:
-        filters["product_name"] = product_category    # in the metadata, "product_name" holds the category
-    if seller_city:
-        filters["seller_city"] = seller_city
-    if order_id:
-        filters["order_id"] = order_id.strip()
-    if seller_id:
-        filters["seller_id"] = seller_id.strip()
-    if product_id:
-        filters["product_id"] = product_id.strip()
-    if order_ids:
-        ids = list(dict.fromkeys(i.strip() for i in order_ids if i and i.strip()))   # no blanks, no duplicates
-        if len(ids) > MAX_ORDER_IDS:
-            return (f"Too many order_ids ({len(ids)}). Send at most {MAX_ORDER_IDS}, or ask the user to narrow "
-                    f"the question down (seller, category, rating).")
-        if ids:
-            filters["order_id"] = ids                 # a list = "any of these orders" (rag_core uses MatchAny)
+        if product_category:
+            filters["product_name"] = product_category    # in the metadata, "product_name" holds the category
+        if seller_city:
+            filters["seller_city"] = seller_city
+        if order_id:
+            filters["order_id"] = order_id.strip()
+        if seller_id:
+            filters["seller_id"] = seller_id.strip()
+        if product_id:
+            filters["product_id"] = product_id.strip()
+        if order_ids:
+            ids = list(dict.fromkeys(i.strip() for i in order_ids if i and i.strip()))   # no blanks, no duplicates
+            if len(ids) > MAX_ORDER_IDS:
+                return (f"Too many order_ids ({len(ids)}). Send at most {MAX_ORDER_IDS}, or ask the user to narrow "
+                        f"the question down (seller, category, rating).")
+            if ids:
+                filters["order_id"] = ids                 # a list = "any of these orders" (rag_core uses MatchAny)
 
-    price_range = {}
-    if min_price is not None:
-        price_range["gte"] = min_price
-    if max_price is not None:
-        price_range["lte"] = max_price
-    if price_range:
-        filters["price"] = price_range
-
-    how_many = max(1, min(int(how_many), 10))         # keep it between 1 and 10
-
-    pattern = None
-    fetch = how_many                                  # how many reviews we ask the search for
-    if must_contain:
-        try:
-            pattern = re.compile(must_contain[:100], re.IGNORECASE)
-        except re.error as error:
-            return f"The must_contain pattern is not a valid regular expression: {error}"
-        fetch = max(how_many, SEARCH_POOL)            # look at more reviews, then keep those that match
-
-    # 2) Do the search. If something goes wrong we RETURN the problem as text instead of crashing,
-    #    so the LLM can read it and try again (or tell the user).
-    try:
-        results = retrieve(query, fetch, filters)
-    except rag_core.FilterError as error:
-        return f"The filters were not valid: {error}"
-    except Exception as error:
-        return f"The review search failed: {type(error).__name__}: {str(error)[:200]}"
-
-    if not results:
-        return "No reviews found for this search. Try fewer filters or different words."
-
-    # Drop reviews that are clearly not about the topic. The search ALWAYS returns the closest reviews,
-    # even for a nonsense question, so without this the LLM would see unrelated reviews and might list them.
-    best_score = max(hit["relevance_score"] for hit in results)
-     # The score means nothing when we look up one order, or when the filters are the topic (general query).
-    use_score = not order_id and not order_ids and not is_general_query(query)
-    if use_score:
-        results = [hit for hit in results if hit["relevance_score"] >= MIN_MATCH]
-    if not results:
-        return (f"No relevant reviews found: the closest ones scored only {best_score:.2f} "
-                f"(below {MIN_MATCH:.2f}), so they are not about this topic. "
-                f"Tell the user that nothing relevant was found, and do not list any reviews.")
-
-    # Keep only the reviews whose text contains what the user asked for (checked here, not by the LLM).
-    checked = 0
-    if pattern is not None:
-        checked = len(results)
-        results = [hit for hit in results if pattern.search(hit["content"])][:how_many]
-        if not results:
-            return (f"None of the {checked} closest reviews contains '{must_contain}'. "
-                    f"Tell the user that no such review was found among the closest ones. Do not list other reviews.")
-
-    # 3) Turn the results into plain text for the LLM to read.
-    lines = []
-    for number, hit in enumerate(results, start=1):
-        meta = hit["metadata"]
-        categories = format_categories(meta.get("product_name", []))
-        prices = ", ".join(str(price) for price in meta.get("price", []))
-        weak = " (weak)" if hit["relevance_score"] < WEAK_MATCH and use_score else ""
-        lines.append(
-            f"{number}) match {hit['relevance_score']:.2f}{weak} | rating {meta.get('review_score')}/5 | "
-            f"category: {categories} | price: {prices} BRL | city: {meta.get('seller_city')} | "
-            f"order_id: {meta.get('order_id')}\n"
-            f"   \"{hit['content']}\""
-        )
-
-    if pattern is not None:
-        lines.append(f"\nMATCHING REVIEWS FOUND: {len(results)} (out of the {checked} closest reviews). Tell the "
-                     f"user exactly this number. If they asked for more, say that fewer were found.")
-
-    has_price_filter = min_price is not None or max_price is not None
-    if has_price_filter:
-        limits = []
+        price_range = {}
         if min_price is not None:
-            limits.append(f"at least {min_price:g}")
+            price_range["gte"] = min_price
         if max_price is not None:
-            limits.append(f"at most {max_price:g}")
-        lines.append(f"\nPRICE FILTER USED: an item price of {' and '.join(limits)} BRL. Tell the user which price "
-                     f"limit you used, and add each quote's price to the parentheses (price: ... BRL).")
+            price_range["lte"] = max_price
+        if price_range:
+            filters["price"] = price_range
 
-    # When EVERY review is weak, the search probably found nothing about the topic. Say it here in code:
-    # with only the prompt, the LLM still listed weak reviews (tested: "bitcoin", "chocolate cake").
-    if use_score and all(hit["relevance_score"] < WEAK_MATCH for hit in results):
-        lines.append("\nALL MATCHES ARE WEAK: none of these reviews is clearly about the question. Read each one and "
-                     "quote ONLY reviews that really answer it. If none does, say that nothing relevant was found "
-                     "and do NOT list any review, not even as an example.")
+        # The role rules (Part 2). Checked AFTER the LLM's filters are built, so it cannot skip them.
+        try:
+            filters, refusal = apply_scope(filters, scope)
+        except Exception as error:
+            return f"The review search failed: could not check the user's access: {type(error).__name__}"
+        if refusal:
+            return refusal
 
-    # The LAST thing the LLM reads before it writes its answer is a reminder of the answer language.
-    # (Without this, the LLM tends to slip back into English after reading the results.)
-    fields = ["rating", "category", "price", "city", "order_id"] if has_price_filter else \
-             ["rating", "category", "city", "order_id"]
-    if "portugu" in answer_language.lower():
-        lines.append("\nANSWER LANGUAGE: Portuguese. Show the original quotes only, no translation. "
-                     f"Still show {', '.join(fields[:-1])} and {fields[-1]}.")
-    else:
-        lines.append(
-            f"\nANSWER LANGUAGE: {answer_language}. Write your summary, your closing sentence and the translation "
-            f"of EVERY quote in {answer_language}, even if these results look English. Show each quote as: "
-            f"\"original Portuguese\" -> \"translation in {answer_language}\" ({', '.join(fields)}). "
-            f"Copy the category, the price and the city exactly as shown in the results."
-        )
-    return "\n".join(lines)
+        how_many = max(1, min(int(how_many), 10))         # keep it between 1 and 10
+
+        pattern = None
+        fetch = how_many                                  # how many reviews we ask the search for
+        if must_contain:
+            try:
+                pattern = re.compile(must_contain[:100], re.IGNORECASE)
+            except re.error as error:
+                return f"The must_contain pattern is not a valid regular expression: {error}"
+            fetch = max(how_many, SEARCH_POOL)            # look at more reviews, then keep those that match
+
+        # 2) Do the search. If something goes wrong we RETURN the problem as text instead of crashing,
+        #    so the LLM can read it and try again (or tell the user).
+        try:
+            results = retrieve(query, fetch, filters)
+        except rag_core.FilterError as error:
+            return f"The filters were not valid: {error}"
+        except Exception as error:
+            return f"The review search failed: {type(error).__name__}: {str(error)[:200]}"
+
+        if not results:
+            return "No reviews found for this search. Try fewer filters or different words."
+
+        # Drop reviews that are clearly not about the topic. The search ALWAYS returns the closest reviews,
+        # even for a nonsense question, so without this the LLM would see unrelated reviews and might list them.
+        best_score = max(hit["relevance_score"] for hit in results)
+         # The score means nothing when we look up one order, or when the filters are the topic (general query).
+        # A customer only searches their own few orders, so that is an order lookup too.
+        use_score = (not order_id and not order_ids and not is_general_query(query)
+                     and scope.role != "customer")
+        if use_score:
+            results = [hit for hit in results if hit["relevance_score"] >= MIN_MATCH]
+        if not results:
+            return (f"No relevant reviews found: the closest ones scored only {best_score:.2f} "
+                    f"(below {MIN_MATCH:.2f}), so they are not about this topic. "
+                    f"Tell the user that nothing relevant was found, and do not list any reviews.")
+
+        # Keep only the reviews whose text contains what the user asked for (checked here, not by the LLM).
+        checked = 0
+        if pattern is not None:
+            checked = len(results)
+            results = [hit for hit in results if pattern.search(hit["content"])][:how_many]
+            if not results:
+                return (f"None of the {checked} closest reviews contains '{must_contain}'. "
+                        f"Tell the user that no such review was found among the closest ones. Do not list other reviews.")
+
+        # 3) Turn the results into plain text for the LLM to read.
+        lines = []
+        for number, hit in enumerate(results, start=1):
+            meta = hit["metadata"]
+            categories = format_categories(meta.get("product_name", []))
+            prices = ", ".join(str(price) for price in meta.get("price", []))
+            weak = " (weak)" if hit["relevance_score"] < WEAK_MATCH and use_score else ""
+            lines.append(
+                f"{number}) match {hit['relevance_score']:.2f}{weak} | rating {meta.get('review_score')}/5 | "
+                f"category: {categories} | price: {prices} BRL | city: {meta.get('seller_city')} | "
+                f"order_id: {meta.get('order_id')}\n"
+                f"   \"{hit['content']}\""
+            )
+
+        if pattern is not None:
+            lines.append(f"\nMATCHING REVIEWS FOUND: {len(results)} (out of the {checked} closest reviews). Tell the "
+                         f"user exactly this number. If they asked for more, say that fewer were found.")
+
+        has_price_filter = min_price is not None or max_price is not None
+        if has_price_filter:
+            limits = []
+            if min_price is not None:
+                limits.append(f"at least {min_price:g}")
+            if max_price is not None:
+                limits.append(f"at most {max_price:g}")
+            lines.append(f"\nPRICE FILTER USED: an item price of {' and '.join(limits)} BRL. Tell the user which price "
+                         f"limit you used, and add each quote's price to the parentheses (price: ... BRL).")
+
+        # When EVERY review is weak, the search probably found nothing about the topic. Say it here in code:
+        # with only the prompt, the LLM still listed weak reviews (tested: "bitcoin", "chocolate cake").
+        if use_score and all(hit["relevance_score"] < WEAK_MATCH for hit in results):
+            lines.append("\nALL MATCHES ARE WEAK: none of these reviews is clearly about the question. Read each one and "
+                         "quote ONLY reviews that really answer it. If none does, say that nothing relevant was found "
+                         "and do NOT list any review, not even as an example.")
+
+        # The LAST thing the LLM reads before it writes its answer is a reminder of the answer language.
+        # (Without this, the LLM tends to slip back into English after reading the results.)
+        fields = ["rating", "category", "price", "city", "order_id"] if has_price_filter else \
+                 ["rating", "category", "city", "order_id"]
+        if "portugu" in answer_language.lower():
+            lines.append("\nANSWER LANGUAGE: Portuguese. Show the original quotes only, no translation. "
+                         f"Still show {', '.join(fields[:-1])} and {fields[-1]}.")
+        else:
+            lines.append(
+                f"\nANSWER LANGUAGE: {answer_language}. Write your summary, your closing sentence and the translation "
+                f"of EVERY quote in {answer_language}, even if these results look English. Show each quote as: "
+                f"\"original Portuguese\" -> \"translation in {answer_language}\" ({', '.join(fields)}). "
+                f"Copy the category, the price and the city exactly as shown in the results."
+            )
+        return "\n".join(lines)
+
+    return search_reviews
 
 
 # =============================================================================
-# Part 3: THE AGENT
+# Part 4: THE AGENT
 # =============================================================================
 def make_system_prompt():
     """The system prompt = the instructions the LLM reads before every question."""
@@ -438,36 +510,61 @@ HOW TO WORK
     return prompt
 
 
-def build_rag_agent(llm=None):
+def make_role_note(scope):
+    """Tells the LLM who the user is and which reviews it can see (the rules themselves are enforced in code)."""
+    if scope.role == "seller":
+        return (f"(The user is the seller {scope.user_id}. search_reviews ALREADY returns only the reviews of this "
+                "seller's own orders, so 'my shop', 'my products', 'toko saya' simply mean all results: do not pass "
+                "seller_id. Reviews of other sellers are not available.)")
+    if scope.role == "customer":
+        return ("(The user is a customer. search_reviews ALREADY returns only the reviews of this customer's own "
+                "orders, so 'my reviews', 'my orders', 'review saya' simply mean all results: use a general query "
+                "like \"avaliação\" and do not pass order_id. Reviews of other customers or of one chosen seller "
+                "are not available; if they ask for those, say so politely.)")
+    return ""
+
+
+def build_rag_agent(llm=None, scope=None):
     """Put the LLM, the tool and the instructions together. Returns the agent.
 
     `llm` is optional: normally we create the OpenAI model here. (The tests pass in a fake one.)
+    `scope` is the login (sql_tools.make_scope); without one the agent sees everything (company).
     """
     if llm is None:
         llm = ChatOpenAI(model=LLM_MODEL, temperature=0)      # temperature 0 = least random answers
-    return create_agent(llm, [search_reviews], system_prompt=make_system_prompt(), name="review_agent")
+    tool_for_login = make_search_tool(scope or Scope("company"))
+    return create_agent(llm, [tool_for_login], system_prompt=make_system_prompt(), name="review_agent")
 
 
 # =============================================================================
-# Part 4: WAYS TO USE THE AGENT
+# Part 5: WAYS TO USE THE AGENT
 # =============================================================================
-_agent = None          # built on first use and then reused (building it each time would be slow)
+_agents = {}           # one agent per login, built on first use and then reused (building it each time is slow)
 
 
-def get_agent():
-    global _agent
-    if _agent is None:
-        _agent = build_rag_agent()
-    return _agent
+def get_agent(scope):
+    if scope not in _agents:
+        _agents[scope] = build_rag_agent(scope=scope)
+    return _agents[scope]
 
 
-def ask_rag_agent(question, show_steps=False):
+def ask_rag_agent(question, show_steps=False, role="company", user_id=None):
     """One question in, one text answer out. No memory between calls.
 
-    This is the function a supervisor can call.
+    role / user_id: the login, as in the SQL agent ("company", or "seller" / "customer" with their
+    seller_id / customer_unique_id). Without user_id a seller or customer uses the demo account of that role.
     """
     try:
-        result = get_agent().invoke({"messages": [{"role": "user", "content": prepare_question(question)}]})
+        scope = make_scope(role, user_id or demo_user_id(role))
+    except ValueError as error:
+        return f"The review agent cannot answer: the login is incomplete ({error})."
+
+    message = prepare_question(question)
+    note = make_role_note(scope)
+    if note:
+        message = f"{note}\n\n{message}"
+    try:
+        result = get_agent(scope).invoke({"messages": [{"role": "user", "content": message}]})
     except Exception as error:         # return the problem as text so the caller never crashes
         return f"The review agent failed: {explain_error(error)}"
 
@@ -484,25 +581,35 @@ def ask_rag_agent(question, show_steps=False):
 
 # The same function, packaged as a TOOL, so a supervisor agent can use it directly.
 # (Again the docstring is what the supervisor's LLM reads.)
-@tool
-def ask_review_agent(question: str) -> str:
-    """Ask the review specialist what customers say: complaints, praise, reasons for a rating.
+# Like make_data_tools in sql_agent.py, the tool is made per login: role and id are NOT tool arguments,
+# because the supervisor's LLM fills those in and could be talked into "I am actually company staff".
+def make_review_tools(role, user_id=None):
+    """Create the review tool for ONE login session. Returns [ask_review_agent].
+    Raises ValueError when the login is not valid, so the app refuses from the start."""
+    scope = make_scope(role, user_id or demo_user_id(role))
 
-    It searches the Portuguese review comments and returns a summary with example quotes, each shown
-    in the original Portuguese AND in a translation (with rating, product category, seller city and order_id).
-    It cannot count or average anything.
+    @tool
+    def ask_review_agent(question: str) -> str:
+        """Ask the review specialist what customers say: complaints, praise, reasons for a rating.
 
-    Arguments:
-        question: a complete, self-contained question. ALWAYS say which language the answer must be in
-            (the language the user wrote in), e.g.
-            "What do customers complain about in the health_beauty category (rating 1-2)? Answer in Bahasa Indonesia."
-    """
-    return ask_rag_agent(question)
+        It searches the Portuguese review comments and returns a summary with example quotes, each shown
+        in the original Portuguese AND in a translation (with rating, product category, seller city and order_id).
+        It cannot count or average anything. The reviews are automatically limited to what the logged-in user
+        may see.
+
+        Arguments:
+            question: a complete, self-contained question. ALWAYS say which language the answer must be in
+                (the language the user wrote in), e.g.
+                "What do customers complain about in the health_beauty category (rating 1-2)? Answer in Bahasa Indonesia."
+        """
+        return ask_rag_agent(question, role=scope.role, user_id=scope.user_id)
+
+    return [ask_review_agent]
 
 
-def chat(show_steps=False):
+def chat(show_steps=False, role="company", user_id=None):
     """A simple loop in the terminal: you type, the agent answers. Each question is answered on its own."""
-    print("Olist review agent. Type your question, or 'exit' to stop.\n")
+    print(f"Olist review agent ({role}). Type your question, or 'exit' to stop.\n")
     while True:
         try:
             question = input("You: ").strip()
@@ -512,7 +619,7 @@ def chat(show_steps=False):
             break
         if not question:
             continue
-        print("Bot:", ask_rag_agent(question, show_steps), "\n")
+        print("Bot:", ask_rag_agent(question, show_steps, role, user_id), "\n")
 
 
 def main(argv=None):
@@ -522,10 +629,18 @@ def main(argv=None):
     if show_steps:
         args.remove("--show-steps")
 
+    options = {"--role": "company", "--user-id": None}
+    for name in options:
+        if name in args:
+            position = args.index(name)
+            options[name] = args[position + 1]
+            del args[position:position + 2]
+    role, user_id = options["--role"], options["--user-id"]
+
     if args:                                          # a question was given: answer once and stop
-        print(ask_rag_agent(" ".join(args), show_steps))
+        print(ask_rag_agent(" ".join(args), show_steps, role, user_id))
     else:
-        chat(show_steps)
+        chat(show_steps, role, user_id)
 
 
 if __name__ == "__main__":
