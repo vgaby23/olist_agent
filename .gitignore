@@ -224,3 +224,7 @@ question.m4a
 shoe.jpg
 data/
 docs/
+dataset/olist.db
+
+# Category embeddings cache (agent/category_resolver.py)
+utils/.category_embeddings.json

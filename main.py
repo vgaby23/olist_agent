@@ -1,3 +1,4 @@
+import logging
 import streamlit as st
 import tempfile
 from pathlib import Path
@@ -5,6 +6,10 @@ from agent import supervisor_agent
 from utils.auth import login_page
 from utils import input_preprocessing
 from langchain_core.messages import HumanMessage, AIMessage
+
+# Print our own INFO logs (e.g. the voice transcript) in the terminal running streamlit
+logging.basicConfig(format="%(asctime)s %(name)s: %(message)s")
+logging.getLogger("utils").setLevel(logging.INFO)
 
 st.set_page_config(page_title="Olist Virtual Assistant", page_icon="🛍️", layout="centered")
 
@@ -14,7 +19,7 @@ st.session_state.setdefault("username", None)
 st.session_state.setdefault("messages", [])
 
 @st.cache_resource
-def get_supervisor(role, user_id, prompt_version=2):
+def get_supervisor(role, user_id, prompt_version=3):
     """Get the supervisor agent for the specified role."""
     return supervisor_agent.supervisor_agent(role, user_id)
 
@@ -29,7 +34,7 @@ def visible_turns(messages):
         if user_message is not None:
             final_answer = next(
                 (message for message in reversed(assistant_messages)
-                 if message.content and not message.content.startswith("Transferring")),
+                 if message.text and not message.text.startswith("Transferring")),
                 None,
             )
             turns.append((user_message, final_answer))
@@ -85,11 +90,23 @@ for user_message, assistant_message in visible_turns(st.session_state["messages"
             st.image(user_message.additional_kwargs["image"], width=300)
         if user_message.additional_kwargs.get("audio"):
             st.audio(user_message.additional_kwargs["audio"])
+        if user_message.additional_kwargs.get("transcript"):
+            st.caption(f"🎤 {user_message.additional_kwargs['transcript']}")
     if assistant_message:
         with st.chat_message("assistant"):
-            st.markdown(assistant_message.content)
+            st.markdown(supervisor_agent.clean_answer(assistant_message.text))
 
-if prompt := st.chat_input("Message the Olist assistant", accept_file = True, accept_audio = True):
+# An answer takes 20-40 s. A message sent meanwhile reran the script and threw away the question in progress,
+# so the input is disabled while one is pending: a submitted prompt is kept in session_state, then the page reruns.
+if submitted := st.chat_input("Message the Olist assistant", accept_file = True, accept_audio = True,
+                              disabled = st.session_state.get("pending_prompt") is not None):
+    st.session_state["pending_prompt"] = submitted
+    st.rerun()
+
+if st.session_state.get("last_error"):
+    st.error(st.session_state.pop("last_error"))
+
+if prompt := st.session_state.get("pending_prompt"):
 
     # Extract the text, files, and audio from the prompt
     prompt_text = prompt.text
@@ -123,7 +140,7 @@ if prompt := st.chat_input("Message the Olist assistant", accept_file = True, ac
         with st.status("Working on a response...", expanded=True) as activity_status:
             activity_steps = []
             try:
-                supervisor = get_supervisor(role, st.session_state.get("agent_id"), prompt_version=2)
+                supervisor = get_supervisor(role, st.session_state.get("agent_id"), prompt_version=3)
                 spoken_text = ""
                 if uploaded_files or recorded_audio:
                     with tempfile.TemporaryDirectory() as temp_dir:
@@ -137,6 +154,11 @@ if prompt := st.chat_input("Message the Olist assistant", accept_file = True, ac
                             audio_path.write_bytes(recorded_audio.getvalue())
 
                         spoken_text = input_preprocessing.voice_to_text(audio_path) if audio_path else ""
+                        if spoken_text:
+                            # Show what Whisper heard, now and in the chat history (also on a refusal)
+                            st.caption(f"🎤 {spoken_text}")
+                            additional_kwargs["transcript"] = spoken_text
+                            user_message.additional_kwargs["transcript"] = spoken_text
                         user_text = " ".join(part for part in (prompt_text, spoken_text) if part).strip()
                         question = input_preprocessing.build_question(
                             text=user_text,
@@ -147,9 +169,9 @@ if prompt := st.chat_input("Message the Olist assistant", accept_file = True, ac
                     question = user_text
 
                 recent_context = "\n".join(
-                    f"{type(message).__name__}: {message.content}"
+                    f"{type(message).__name__}: {message.text}"
                     for message in st.session_state["messages"][-8:]
-                    if isinstance(message, (HumanMessage, AIMessage)) and message.content
+                    if isinstance(message, (HumanMessage, AIMessage)) and message.text
                 )
                 scope_decision = supervisor_agent.check_request_scope(
                     role=role,
@@ -160,7 +182,9 @@ if prompt := st.chat_input("Message the Olist assistant", accept_file = True, ac
                 )
 
                 if not scope_decision.allowed:
-                    final_answer = AIMessage(content=scope_decision.reply)
+                    # violated_rule (e.g. "C1", see agent/policy.py) is kept for debugging, not shown to the user
+                    final_answer = AIMessage(content=scope_decision.reply,
+                                             additional_kwargs={"violated_rule": scope_decision.violated_rule})
                     st.session_state["messages"] = [*input_messages, final_answer]
                 else:
                     supervisor_message = HumanMessage(
@@ -172,7 +196,7 @@ if prompt := st.chat_input("Message the Olist assistant", accept_file = True, ac
                         additional_kwargs={
                             **additional_kwargs,
                             "answer_language": scope_decision.answer_language,
-                            "display_content": user_text,
+                            "display_content": prompt_text,    # the transcript is shown separately
                         },
                     )
                     supervisor_input = [*st.session_state["messages"], supervisor_message]
@@ -196,17 +220,19 @@ if prompt := st.chat_input("Message the Olist assistant", accept_file = True, ac
                     new_messages = updated_messages[len(supervisor_input):]
                     final_answer = next(
                         (message for message in reversed(new_messages)
-                         if isinstance(message, AIMessage) and message.content
-                         and not message.content.startswith("Transferring")),
+                         if isinstance(message, AIMessage) and message.text
+                         and not message.text.startswith("Transferring")),
                         None,
                     )
                 activity_status.update(label="Answer ready", state="complete")
             except Exception as error:
                 st.session_state["messages"] = input_messages
                 activity_status.update(label="Couldn't complete the request", state="error")
-                st.error(f"I couldn't get a response from the assistant: {error}")
+                st.session_state["last_error"] = f"I couldn't get a response from the assistant: {error}"
                 final_answer = None
 
         if final_answer:
             final_answer.additional_kwargs["activity"] = activity_steps
-            st.markdown(final_answer.content)
+
+    st.session_state["pending_prompt"] = None
+    st.rerun()      # enables the input again; the answer is shown from the chat history

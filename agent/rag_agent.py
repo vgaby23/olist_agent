@@ -18,24 +18,25 @@ HOW THE SUPERVISOR USES IT
         ).compile()
 
     build_rag_agent() returns a specialist agent. Company sessions can search platform-wide reviews;
-    seller sessions are forced to their own seller ID, and customer sessions are restricted to their
-    own order IDs by a wrapper around the search tool. Those constraints are enforced in code.
+    seller sessions are forced to their own seller ID, and anonymous customer sessions cannot search by
+    seller or order. Those constraints are enforced in code (apply_scope).
     To call the review agent directly (question in, text out, no memory between calls):
 
-        from agent.RAG_agent import ask_rag_agent
+        from agent.rag_agent import ask_rag_agent
         text = ask_rag_agent("What do customers complain about in health_beauty?", role="customer")
 
-    WHO SEES WHAT (enforced in code, see Part 2)
+    WHO SEES WHAT (enforced in code, see Part 2; the full rule list is in agent/policy.py)
       * company:  all reviews.
       * seller:   only the reviews of their own orders (seller_id is always forced to theirs).
-      * customer: only the reviews of their own orders.
+      * customer: anonymous shopper: all reviews by category / product / rating / price / city, but not
+                  by one seller or by order, and without order ids in the results.
 
     Rules for the supervisor:
       * Send a COMPLETE question. This agent does not see the conversation, so write the category,
         rating or city into the question itself.
       * Say in the question which LANGUAGE the user wrote in (e.g. "Answer in Bahasa Indonesia"). The
-        reviews are Portuguese; every quote comes back as the Portuguese original PLUS a translation
-        into that language. Without a hint, the agent uses the language of the question you send it.
+        reviews are Portuguese; every quote comes back translated into that language (the Portuguese
+        original only when Portuguese is asked). Without a hint, the agent uses the language of the question.
       * To get the review of ONE order (e.g. after the SQL agent found its order_id), put the order_id in the
         question: "What did order <order_id> say?". Price limits ("above 150 BRL") also work as filters.
       * A SELLER user's reviews are already limited to their shop, so "Why do my customers give low ratings?"
@@ -65,10 +66,12 @@ THE FILE HAS 5 PARTS
     4. The agent (instructions + build_rag_agent)
     5. Ways to use it: ask_rag_agent, make_review_tools (for the supervisor), chat, main
 """
+import difflib
 import json
 import os
 import re
 import sys
+import unicodedata
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -78,7 +81,8 @@ load_dotenv()
 
 from langchain.agents import create_agent
 from langchain_core.tools import tool
-from langchain_openai import ChatOpenAI
+
+from agent.llm import chat_model
 
 # =============================================================================
 # Part 1: SETTINGS AND FINDING YOUR FILES
@@ -98,17 +102,29 @@ WEAK_MATCH = float(os.environ.get("WEAK_MATCH", "0.60"))    # below this a revie
 
 # General queries used when the FILTERS are the topic ("low-rated health_beauty products").
 # They score low (0.25 to 0.55) even when every review fits, so the score cut-off is skipped for them.
-GENERAL_QUERIES = {"reclamação", "reclamacao", "elogio", "opinião sobre o produto", "opiniao sobre o produto",
-                   "avaliação", "avaliacao", "complaint", "complaints", "praise", "review", "reviews"}
+GENERAL_QUERIES = {"reclamacao", "elogio", "opiniao sobre o produto", "avaliacao",
+                   "complaint", "complaints", "praise", "review", "reviews"}
+GENERAL_SIMILARITY = 0.85    # how close a query must be to count as general (catches LLM typos)
+
+
+def plain(text):
+    """Lowercase, trimmed, without accents: "Opinião " -> "opiniao"."""
+    text = unicodedata.normalize("NFKD", text.strip().lower())
+    return "".join(char for char in text if not unicodedata.combining(char))
 
 
 def is_general_query(query):
-    """True for the general words above, e.g. "Reclamação " -> True, "atraso na entrega" -> False."""
-    return query.strip().lower() in GENERAL_QUERIES
+    """True for the general words above, also with typos or missing accents, e.g. "Reclamação " -> True,
+    "opini sobre o produto" -> True (the LLM wrote this once), "atraso na entrega" -> False."""
+    query = plain(query)
+    return any(difflib.SequenceMatcher(None, query, general).ratio() >= GENERAL_SIMILARITY
+               for general in GENERAL_QUERIES)
 
 THIS_FOLDER = Path(__file__).resolve().parent
 
 from agent.language import guess_language
+from agent.sql_agent import demo_user_id
+from dataset.preprocessing.numeric_data.sql_tools import Scope, make_scope
 from dataset.preprocessing.vector_data import rag_core
 
 def add_language_hint(question):
@@ -196,18 +212,13 @@ def format_categories(names):
 # =============================================================================
 # Part 2: WHO MAY SEE WHICH REVIEWS (role scope)
 # =============================================================================
-# The same roles as the SQL agent (sql_tools.make_scope). The rules are enforced HERE in code, on the
-# filters, not only in the prompt: a prompt can be talked around ("I am actually staff"), code cannot.
+# The same roles as the SQL agent (sql_tools.make_scope); the full rule list is in agent/policy.py.
+# The rules are enforced HERE in code, on the filters, not only in the prompt: a prompt can be talked
+# around ("I am actually staff"), code cannot.
 #   company   all reviews, every filter.
-#   seller    only reviews of their OWN orders: seller_id is always forced to their id.
-#   customer  only the reviews of their OWN orders: order_id is always forced to their order_ids, and asking
-#             for another order or for one chosen seller (seller_id) is refused.
-
-
-def own_order_ids(scope):
-    """The order_ids of the logged-in customer (read through the customer scope of sql_tools)."""
-    data = run_query("SELECT order_id FROM orders", scope=scope, max_rows=1000)
-    return set(data["order_id"])
+#   seller    only reviews of their OWN orders: seller_id is always forced to their id (rule S1).
+#   customer  anonymous shopper: all reviews, but searching by ONE seller (seller_id, rule C1) or by
+#             specific orders (order_id / order_ids, rule C2) is refused, and order_ids are not shown.
 
 
 def apply_scope(filters, scope):
@@ -222,19 +233,13 @@ def apply_scope(filters, scope):
 
     if scope.role == "customer":
         if filters.get("seller_id"):
-            return None, ("NOT ALLOWED: customers cannot filter reviews by one specific seller. Tell the user "
-                          "this politely: they can only read the reviews of their own orders.")
-        own = own_order_ids(scope)
-        asked = filters.get("order_id")
-        if asked:
-            asked = asked if isinstance(asked, list) else [asked]
-            if not set(asked) <= own:
-                return None, ("NOT ALLOWED: a customer can only look up the reviews of their OWN orders. Tell the "
-                              "user this politely and do not search again for those orders.")
-            return filters, None
-        if not own:
-            return None, "This customer has no orders, so there are no reviews to show. Tell the user so."
-        return {**filters, "order_id": sorted(own)}, None
+            return None, ("NOT ALLOWED (rule C1): reviews of one specific seller are not available. Tell the user "
+                          "this politely: they can search reviews by product category, product type, rating or "
+                          "price instead. Do not search again for that seller.")
+        if filters.get("order_id"):
+            return None, ("NOT ALLOWED (rule C2): reviews of specific orders are not available. Tell the user this "
+                          "politely: they can search reviews by product category, product type, rating or price "
+                          "instead. Do not search again for those orders.")
     return filters, None
 
 
@@ -287,7 +292,9 @@ def make_search_tool(scope):
             seller_id: only reviews of orders from ONE seller (the long seller id, copied exactly). Use it when the question is about a specific seller or shop. With no other topic, use a general query like "reclamação".
             product_id: only reviews of orders that contain ONE specific product (the long product id, copied exactly).
             min_price: only orders with an item that costs at least this many Brazilian reais (BRL).
+                "above / more than / di atas / lebih dari / acima de X" -> min_price=X (NOT max_price).
             max_price: only orders with an item that costs at most this many reais (BRL).
+                "below / under / di bawah / kurang dari / abaixo de X" -> max_price=X.
             must_contain: a regular expression the review text must match (case-insensitive). Use it when the user
                 wants reviews that contain something specific, e.g. "[0-9]{1,2}/[0-9]{1,2}" for a date or
                 "sedex|correios" for words. Only the 50 closest reviews are checked.
@@ -363,10 +370,9 @@ def make_search_tool(scope):
         # Drop reviews that are clearly not about the topic. The search ALWAYS returns the closest reviews,
         # even for a nonsense question, so without this the LLM would see unrelated reviews and might list them.
         best_score = max(hit["relevance_score"] for hit in results)
-         # The score means nothing when we look up one order, or when the filters are the topic (general query).
-        # A customer only searches their own few orders, so that is an order lookup too.
-        use_score = (not order_id and not order_ids and not is_general_query(query)
-                     and scope.role != "customer")
+        # The score means nothing when we look up one order, or when the filters are the topic (general query).
+        use_score = not order_id and not order_ids and not is_general_query(query)
+        show_order_id = scope.role != "customer"          # rule C2: an anonymous user gets no order ids
         if use_score:
             results = [hit for hit in results if hit["relevance_score"] >= MIN_MATCH]
         if not results:
@@ -390,10 +396,10 @@ def make_search_tool(scope):
             categories = format_categories(meta.get("product_name", []))
             prices = ", ".join(str(price) for price in meta.get("price", []))
             weak = " (weak)" if hit["relevance_score"] < WEAK_MATCH and use_score else ""
+            order = f" | order_id: {meta.get('order_id')}" if show_order_id else ""
             lines.append(
                 f"{number}) match {hit['relevance_score']:.2f}{weak} | rating {meta.get('review_score')}/5 | "
-                f"category: {categories} | price: {prices} BRL | city: {meta.get('seller_city')} | "
-                f"order_id: {meta.get('order_id')}\n"
+                f"category: {categories} | price: {prices} BRL | city: {meta.get('seller_city')}{order}\n"
                 f"   \"{hit['content']}\""
             )
 
@@ -420,16 +426,17 @@ def make_search_tool(scope):
 
         # The LAST thing the LLM reads before it writes its answer is a reminder of the answer language.
         # (Without this, the LLM tends to slip back into English after reading the results.)
-        fields = ["rating", "category", "price", "city", "order_id"] if has_price_filter else \
-                 ["rating", "category", "city", "order_id"]
+        fields = ["rating", "category", "price", "city"] if has_price_filter else ["rating", "category", "city"]
+        if show_order_id:
+            fields.append("order_id")
         if "portugu" in answer_language.lower():
             lines.append("\nANSWER LANGUAGE: Portuguese. Show the original quotes only, no translation. "
                          f"Still show {', '.join(fields[:-1])} and {fields[-1]}.")
         else:
             lines.append(
                 f"\nANSWER LANGUAGE: {answer_language}. Write your summary, your closing sentence and the translation "
-                f"of EVERY quote in {answer_language}, even if these results look English. Show each quote as: "
-                f"\"original Portuguese\" -> \"translation in {answer_language}\" ({', '.join(fields)}). "
+                f"of EVERY quote in {answer_language}, even if these results look English. Show each quote only as "
+                f"\"translation in {answer_language}\" ({', '.join(fields)}), without the Portuguese original. "
                 f"Copy the category, the price and the city exactly as shown in the results."
             )
         return "\n".join(lines)
@@ -445,25 +452,34 @@ def make_system_prompt():
     prompt = """You are the REVIEW specialist for Olist, a Brazilian online marketplace.
 You have one tool: search_reviews. Use it to find out what customers say.
 
+WHEN A SUPERVISOR HANDS YOU A CONVERSATION
+- You may receive the whole conversation, including answers from other specialists. YOU are the review
+  specialist the supervisor wants: never say you asked or will ask another specialist.
+- Find the review part of the user's latest request and call search_reviews yourself, using the exact
+  product IDs, order IDs, categories and ratings from the earlier specialist results (for example one
+  search per product ID with max_rating=2, or ONE search with up to 50 order_ids). Then answer only the
+  review part; the supervisor combines it with the numbers.
+
 LANGUAGE (the most important rule)
 - The reviews are in Portuguese. Your ANSWER LANGUAGE is the language the question is written in
   (English, Bahasa Indonesia, ...), or the language the question asks for. Decide it first and pass it
   to search_reviews as answer_language.
 - Write EVERYTHING you say in the answer language: the summary, the translations and the closing sentence.
   Never switch to English because the tool results look English.
-- Show every quote in BOTH languages: the Portuguese original exactly as written, then the translation,
-  then the rating, the product category, the seller city and the order_id. Translate faithfully.
+- Show every quote ONLY as a faithful translation into the answer language, then the rating, the product
+  category, the seller city and the order_id. Do not show the Portuguese original next to it.
   If the answer language is Portuguese, show the original only (still with rating, category, city and order_id).
 - Copy the product category ("category: ...") and the seller city ("city: ...") exactly as given in the
   search results. Do not translate or guess them. If an order has several categories, show all of them.
 
-Example, question in Bahasa Indonesia (answer_language "Bahasa Indonesia"):    Berikut beberapa ulasan tentang produk rusak:
-    1. "produk rusak pada pemakaian pertama." (rating 1/5, category: health_beauty, city: sao paulo, order_id abc123)
-    Ulasan-ulasan ini menunjukkan ketidakpuasan terhadap kualitas produk.
+Example, question in Bahasa Indonesia (answer_language "Bahasa Indonesia"):
+  Berikut beberapa ulasan tentang produk rusak:
+  1. "produk rusak pada pemakaian pertama." (rating 1/5, category: health_beauty, city: sao paulo, order_id abc123)
+  Ulasan-ulasan ini menunjukkan ketidakpuasan terhadap kualitas produk.
 
 Example, question in English (answer_language "English"):
   Here are some reviews about damaged products:
-    1. "the product broke on the first use." (rating 1/5, category: health_beauty, city: sao paulo, order_id abc123)
+  1. "the product broke on the first use." (rating 1/5, category: health_beauty, city: sao paulo, order_id abc123)
   These reviews show dissatisfaction with product quality.
 
 HOW TO WORK
@@ -477,11 +493,16 @@ HOW TO WORK
   min_rating=4, NOT "elogio". "complaints about late delivery" -> query "atraso na entrega" with max_rating=2.
   Only If the question has NO topic besides the filters (e.g. "low-rated health_beauty products"), use a general
   query: "reclamação" for low ratings, "elogio" for high ratings, "opinião sobre o produto" otherwise.
-  Never use a category name such as "health_beauty" as the query.
+  Never use a category name such as "health_beauty" as the query. A product type that the product_category
+  filter already covers ("make up", "lipstik", "sepatu" with product_category set) is NOT a topic either: use
+  the general query. Only a real issue (broken, late, fake, smell...) is a topic.
 - "worst" or "lowest rated" means max_rating=1.
 - Only add a filter when the question asks for it. Use a rating filter only for complaints, praise or stars.
 - Price: "expensive", "cheap" or an amount -> min_price / max_price (Brazilian reais). Pick a sensible limit
   (e.g. min_price=150 for "expensive", max_price=50 for "cheap") and tell the user which limit you used.
+  Mind the direction: "above X" / "di atas X" -> min_price=X; "below X" / "di bawah X" -> max_price=X.
+- "Opinion" / "pendapat" questions with only filters (category, price) are NOT complaints: no rating filter,
+  query "opinião sobre o produto".
 - A specific order -> order_id, with the general query "avaliação". The search cannot find an order any other way.
 - TWO OR MORE orders (a list of order_ids, e.g. found by the data agent for a month) -> order_ids, ONE search with all of them (up to 50). Do not search them one by one.
 - A specific seller -> seller_id; a specific product -> product_id (copy the long id exactly). If the question has no other topic, use a general query: "reclamação" for low ratings, "elogio" for high ratings.
@@ -519,23 +540,31 @@ def make_role_note(scope):
                 "seller's own orders, so 'my shop', 'my products', 'toko saya' simply mean all results: do not pass "
                 "seller_id. Reviews of other sellers are not available.)")
     if scope.role == "customer":
-        return ("(The user is a customer. search_reviews ALREADY returns only the reviews of this customer's own "
-                "orders, so 'my reviews', 'my orders', 'review saya' simply mean all results: use a general query "
-                "like \"avaliação\" and do not pass order_id. Reviews of other customers or of one chosen seller "
-                "are not available; if they ask for those, say so politely.)")
+        return ("(The user is an anonymous shopper. They may search all reviews by product category, product, "
+                "rating, price or seller city. Do not pass seller_id, order_id or order_ids: reviews of one "
+                "specific seller or order are not available, so if they ask for those, say so politely. The results "
+                "contain no order_id; do not mention order ids in the answer.)")
     return ""
 
 
-def build_rag_agent(llm=None, scope=None):
+def build_rag_agent(llm=None, scope=None, role=None, user_id=None):
     """Put the LLM, the tool and the instructions together. Returns the agent.
 
-    `llm` is optional: normally we create the OpenAI model here. Seller/customer tools are scoped
-    to their authenticated records; company review search remains platform-wide.
+    `llm` is optional: normally we create the OpenAI model here. Pass the login either as `scope`
+    (sql_tools.make_scope) or as `role` + `user_id` (validated here, raises ValueError when invalid).
+    Without either the agent sees everything (company). Seller/customer tools are scoped to their
+    authenticated records; company review search remains platform-wide.
     """
     if llm is None:
-        llm = ChatOpenAI(model=LLM_MODEL, temperature=0)      # temperature 0 = least random answers
-    tool_for_login = make_search_tool(scope or Scope("company"))
-    return create_agent(llm, [tool_for_login], system_prompt=make_system_prompt(), name="review_agent")
+        llm = chat_model(LLM_MODEL, temperature=0)            # temperature 0 = least random (if the model allows it)
+    if scope is None:
+        scope = make_scope(role, user_id) if role else Scope("company")
+    # The role note goes in the system prompt, so it also reaches the agent when the supervisor calls it.
+    system_prompt = make_system_prompt()
+    note = make_role_note(scope)
+    if note:
+        system_prompt += f"\n\nTHE LOGGED-IN USER\n{note}\n"
+    return create_agent(llm, [make_search_tool(scope)], system_prompt=system_prompt, name="review_agent")
 
 
 # =============================================================================
@@ -562,9 +591,6 @@ def ask_rag_agent(question, show_steps=False, role="company", user_id=None):
         return f"The review agent cannot answer: the login is incomplete ({error})."
 
     message = prepare_question(question)
-    note = make_role_note(scope)
-    if note:
-        message = f"{note}\n\n{message}"
     try:
         result = get_agent(scope).invoke({"messages": [{"role": "user", "content": message}]})
     except Exception as error:         # return the problem as text so the caller never crashes
@@ -578,26 +604,27 @@ def ask_rag_agent(question, show_steps=False, role="company", user_id=None):
                 shown = str(message.content)
                 print("   [tool result]\n" + "\n".join("      " + line for line in shown[:3000].splitlines()))
 
-    return result["messages"][-1].content
+    return result["messages"][-1].text     # .text: newer models return a list of content blocks
 
 
 # The same function, packaged as a TOOL, so a supervisor agent can use it directly.
 # (Again the docstring is what the supervisor's LLM reads.)
-@tool
-def ask_review_agent(question: str) -> str:
-    """Ask the review specialist what customers say: complaints, praise, reasons for a rating.
+# Like make_data_tools in sql_agent.py, the tool is made per login: role and id are NOT tool arguments,
+# because the supervisor's LLM fills those in and could be talked into "I am actually company staff".
+def make_review_tools(role, user_id=None):
+    """Create the review tool for ONE login session. Returns [ask_review_agent].
+    Raises ValueError when the login is not valid, so the app refuses from the start."""
+    scope = make_scope(role, user_id or demo_user_id(role))
 
-    It searches Portuguese review comments and returns a summary with example quotes in the requested
-    answer language, plus rating, product category, seller city and order_id. It shows Portuguese source
-    text only when Portuguese is the requested answer language.
-    It cannot count or average anything.
+    @tool
+    def ask_review_agent(question: str) -> str:
+        """Ask the review specialist what customers say: complaints, praise, reasons for a rating.
 
-    Arguments:
-        question: a complete, self-contained question. ALWAYS say which language the answer must be in
-            (the language the user wrote in), e.g.
-            "What do customers complain about in the health_beauty category (rating 1-2)? Answer in Bahasa Indonesia."
-    """
-    return ask_rag_agent(question)
+        It searches Portuguese review comments and returns a summary with example quotes in the requested
+        answer language, plus rating, product category, seller city and order_id. It shows Portuguese source
+        text only when Portuguese is the requested answer language.
+        It cannot count or average anything. The reviews are automatically limited to what the logged-in
+        user may see.
 
         Arguments:
             question: a complete, self-contained question. ALWAYS say which language the answer must be in

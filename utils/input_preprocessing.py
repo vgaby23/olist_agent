@@ -27,6 +27,7 @@ categories.json is thrown away, so a made-up name can never reach the search.
 """
 import base64
 import json
+import logging
 import mimetypes
 import os
 import sys
@@ -43,6 +44,12 @@ from pydantic import BaseModel, Field                    # noqa: E402
 # =============================================================================
 VISION_MODEL = os.environ.get("VISION_MODEL", "gpt-4o-mini")   # any OpenAI chat model that can see images
 STT_MODEL = os.environ.get("STT_MODEL", "whisper-1")           # speech-to-text model
+# Spoken language as an ISO code. Without it Whisper guesses, and it often mis-heard Indonesian (even as Thai).
+# Set STT_LANGUAGE=auto in .env to let Whisper detect the language again.
+STT_LANGUAGE = os.environ.get("STT_LANGUAGE", "id")
+# A few words in the expected style help Whisper spell the domain words right (it is a hint, not a filter).
+STT_PROMPT = os.environ.get("STT_PROMPT", "Olist, ulasan, pembeli, penjual, sepatu, elektronik, kecantikan, "
+                                          "pengiriman, reais, Sao Paulo, Rio de Janeiro.")
 MAX_FILE_MB = 20                                               # refuse huge files before paying for them
 IMAGE_TYPES = {".jpg", ".jpeg", ".png", ".webp", ".gif"}
 AUDIO_TYPES = {".mp3", ".mp4", ".m4a", ".wav", ".webm", ".mpeg", ".mpga", ".ogg", ".flac"}
@@ -60,6 +67,7 @@ def find_categories():
 
 
 CATEGORIES = find_categories()
+log = logging.getLogger(__name__)
 
 
 class InputError(Exception):
@@ -83,16 +91,22 @@ def check_file(path, allowed_types, kind):
 # Part 2: VOICE -> TEXT
 # =============================================================================
 def voice_to_text(audio_path, language=None):
-    """Transcribe a voice file. `language` is an optional ISO code like "id" or "en" (helps accuracy)."""
+    """Transcribe a voice file. `language` is an ISO code like "id" or "en" (helps accuracy);
+    without it STT_LANGUAGE is used, and "auto" lets Whisper detect the language."""
     file = check_file(audio_path, AUDIO_TYPES, "audio")
     from openai import OpenAI
 
     options = {"model": STT_MODEL}
-    if language:
+    language = (language or STT_LANGUAGE or "").strip().lower()
+    if language and language != "auto":
         options["language"] = language
+    if STT_PROMPT:
+        options["prompt"] = STT_PROMPT
     with open(file, "rb") as audio:
         result = OpenAI().audio.transcriptions.create(file=audio, **options)
     text = result.text.strip()
+    # Logged so a wrong answer can be traced back to a mis-heard question.
+    log.info("Voice transcript (%s, language=%s): %r", STT_MODEL, options.get("language", "auto"), text)
     if not text:
         raise InputError("I couldn't hear any words in the audio. Please try again.")
     return text
@@ -114,7 +128,8 @@ def image_to_guess(image_path):
     """Ask the vision model what product is in the photo. Returns a ProductGuess."""
     file = check_file(image_path, IMAGE_TYPES, "image")
     from langchain_core.messages import HumanMessage
-    from langchain_openai import ChatOpenAI
+
+    from agent.llm import chat_model
 
     mime = mimetypes.guess_type(str(file))[0] or "image/jpeg"
     picture = base64.b64encode(file.read_bytes()).decode()
@@ -125,7 +140,7 @@ def image_to_guess(image_path):
         {"type": "text", "text": instruction},
         {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{picture}"}},
     ])
-    model = ChatOpenAI(model=VISION_MODEL, temperature=0).with_structured_output(ProductGuess)
+    model = chat_model(VISION_MODEL, temperature=0).with_structured_output(ProductGuess)
     return model.invoke([message])
 
 

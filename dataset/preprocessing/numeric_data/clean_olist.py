@@ -1,11 +1,11 @@
 """
 Cleaning dataset Olist -> SQLite (untuk SQL Agent).
-(Data review untuk RAG ada di Qdrant, dibuat oleh data_preprocessing/vector_data/text_ingest.py.)
+(Data review untuk RAG ada di Qdrant, dibuat oleh dataset/preprocessing/vector_data/text_ingest.py.)
 
 Prinsip: CSV mentah tidak diubah; hasil bersih ditulis ke olist.db baru.
 
 Cara pakai (dari folder utama proyek):
-    python data_preprocessing/numeric_data/clean_olist.py
+    python dataset/preprocessing/numeric_data/clean_olist.py
 
 Aturan cleaning:
     - revenue = SUM(order_items.price) dari order delivered; order lain tidak dihapus, hanya ditandai

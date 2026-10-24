@@ -24,6 +24,7 @@ from langchain.agents import create_agent
 from langchain_core.tools import InjectedToolCallId, tool
 from langgraph.errors import GraphRecursionError
 
+from agent.language import guess_language
 from dataset.preprocessing.numeric_data.sql_tools import get_schema, make_scope, run_query
 
 # Aksara non-Latin (Ibrani, Arab, Thai, Cyrillic, CJK, dst.) yang tidak boleh muncul di jawaban
@@ -56,7 +57,8 @@ BUSINESS RULES (follow them strictly):
    default analysis window 2017-01 to 2018-08; do not write that range by hand). This also applies to rankings and
    totals by city, state, seller, category or payment type, not only to trends. If the user names a period, filter on
    orders.purchase_month ('YYYY-MM') or orders.purchase_year instead. Monthly trends: GROUP BY orders.purchase_month.
-   Yearly: GROUP BY orders.purchase_year.
+   Yearly: GROUP BY orders.purchase_year. Exception: when the user asks about the WHOLE dataset ("in the dataset",
+   "in total", "all time", "di seluruh data"), use no period filter.
 3. A customer is identified by customers.customer_unique_id (customer_id is unique per order, NOT per person).
    Join: orders.customer_id = customers.customer_id. When counting customers ALWAYS use
    COUNT(DISTINCT customers.customer_unique_id); never COUNT(*) or COUNT(customer_id) on the customers table.
@@ -79,6 +81,9 @@ BUSINESS RULES (follow them strictly):
 8. Sellers have NO name: identify them by seller_id plus seller_city and seller_state.
 9. The database has NO cost, profit, or commission data. Product dimensions/weight are not available either.
 10. Use LIMIT 10 for rankings and lists unless the user asks for a different number. Round money to 2 decimals.
+    Only when the user asks for ONE item ("the top category", "my best-selling product"), still use LIMIT 5 so a
+    tie is visible. Plural questions ("which categories...", "top products") get the normal LIMIT 10 list; never
+    filter them down to rank 1.
 11. Only use tables, views and columns that exist in the schema. Never prefix them with main. or temp.
 12. When the answer is about specific sellers, orders, products or customers, ALWAYS also SELECT their id column
     (seller_id, order_id, product_id, customer_unique_id), so other agents can use it.
@@ -91,12 +96,14 @@ BUSINESS RULES (follow them strictly):
     Dates are TEXT 'YYYY-MM-DD HH:MM:SS'. Money is in BRL.
 16. category_stats is a ready-made, platform-wide summary per product category (all sellers). Use it for
     market or competitor comparisons by category (most-loved categories on the platform, average price, items sold).
+    product_stats is the same per product_id, state_delivery_stats gives delivery times per buyer state.
+17. Category names: always filter on the exact English category name (e.g. 'health_beauty'). The supervisor maps
+    product types ("make up", "sepatu") to that name before asking; never invent a category name.
 
 WHEN THE DATABASE CANNOT ANSWER:
 - If the question cannot be answered with this database (for example profit, product name, seller name),
   do NOT call run_sql: politely say so in one or two short sentences and do not invent any data.
 """.strip()
-#### Tambah aturan untuk mapping product dengan kategori terdekat
 
 # Aturan menulis jawaban akhir (dulu prompt ringkasan terpisah; sekarang bagian dari system prompt agent)
 ANSWER_RULES = """
@@ -116,16 +123,20 @@ WRITING THE ANSWER (after run_sql returned a result):
 - Copy category names EXACTLY as in the result, underscores included and NOT capitalised: write health_beauty,
   never "Health & Beauty" or "Health Beauty" (other agents search with these exact names).
 - Follow the NOTES FOR THE ANSWER that run_sql returns with each result (period covered, truncated rows).
+  ALWAYS state the period the numbers cover in one short phrase, even for a single number.
+- Ties: when the user asked for ONE item and several items share the deciding value, say there is a tie and
+  name all of them; never present just one as the single winner. In a ranked list, just show tied ranks.
+- When the answer reports revenue or sales value, say in a few words what it counts: item prices of delivered
+  orders, excluding freight (or including freight, if the query added it).
 """.strip()
 
 
 def get_llm():
-    """Buat koneksi ke OpenAI (key dan model dibaca dari file .env)."""
-    from dotenv import load_dotenv
-    from langchain_openai import ChatOpenAI
+    """Buat koneksi ke OpenAI (key dan model dibaca dari file .env).
+    temperature 0 = SQL yang konsisten; model reasoning (mis. gpt-6-luna) tidak menerimanya, lihat agent/llm.py."""
+    from agent.llm import chat_model
 
-    load_dotenv()
-    return ChatOpenAI(model=os.getenv("LLM_MODEL", "gpt-4o-mini"), temperature=0)   # 0 = SQL yang konsisten
+    return chat_model(temperature=0)
 
 
 def _text(response):
@@ -147,7 +158,9 @@ def pick_language(question, language=None):
     """Use the language supplied by the supervisor; default defensively if it is missing."""
     if language:
         return language
-    hint = re.search(r"answer in ([A-Za-z][A-Za-z ]{1,30}?)\s*[.!\n]", question + "\n", re.IGNORECASE)
+    # "Answer in Bahasa Indonesia." or the supervisor's "ANSWER LANGUAGE: Bahasa Indonesia."
+    hint = re.search(r"answer (?:in|language\s*:)\s*([A-Za-z][A-Za-z ]{1,30}?)\s*[.!,\n]",
+                     question + "\n", re.IGNORECASE)
     if hint:
         return hint.group(1).strip()
     return guess_language(question) or "the same language as the question"
@@ -164,15 +177,19 @@ def make_role_note(scope):
                 "other sellers' items). For revenue still use SUM(order_items.price). For comparisons with the "
                 "market use category_stats (platform-wide, per category).")
     if scope.role == "customer":
-        return (f"The user is the customer {scope.user_id}. The tables customers, orders, order_items, "
-                "order_payments, order_reviews and sellers ALREADY contain only this customer's own data, so "
-                "'my', 'me', 'I', 'saya' simply mean all rows. Do NOT filter on this id yourself (it is a "
-                "customer_unique_id, not a customer_id): just query the tables. Other customers' data is not available.")
+        return ("The user is an anonymous shopper (no account). Only the tables products and br_states and the "
+                "platform-wide views category_stats, product_stats and state_delivery_stats can be read; every "
+                "other table is blocked. Answer with these aggregates only. For shoppers, items sold and average "
+                "price are not available: use sales_rank and price_level for ordering, report price_band and "
+                "review_volume, and never estimate sales volume or revenue. Questions about one specific order, "
+                "seller or customer, seller rankings or company revenue cannot be answered: say so politely "
+                "without calling run_sql.")
     return "The user is a company (platform) employee and can see all data."
 
 
 PERIOD_FILTER = re.compile(r"in_trend_period|purchase_month|purchase_year|order_purchase_timestamp")
 ORDER_TABLES = re.compile(r"\b(orders|order_items|order_payments|order_reviews)\b")
+PUBLIC_VIEWS = re.compile(r"\b(category_stats|product_stats|state_delivery_stats)\b")
 
 
 def missing_period(sql):
@@ -184,8 +201,8 @@ def missing_period(sql):
 def period_note(sql):
     """Catatan periode untuk prompt ringkasan, sesuai filter yang BENAR-BENAR ada di SQL (bukan asumsi)."""
     lowered = sql.lower()
-    if "in_trend_period" in lowered:
-        note = ("- The numbers cover January 2017 to August 2018 (the default analysis period); say so briefly. "
+    if "in_trend_period" in lowered or PUBLIC_VIEWS.search(lowered):    # the views are built on that window too
+        note =("- The numbers cover January 2017 to August 2018 (the default analysis period); say so briefly. "
                 "If years are compared or a 2018 total is given, mention that 2018 only contains January to August.")
     elif PERIOD_FILTER.search(lowered):
         note = ("- The query filters on the period the user asked for. If that period includes months before "
@@ -211,8 +228,9 @@ def format_result(data, sql):
     if data.attrs.get("truncated"):
         notes += f"- Only the first {len(data)} rows are shown; the full result has more. Tell the user.\n"
     if missing_period(sql):     # LLM sering lupa aturan 2: ingatkan di hasil, bukan hanya di system prompt
-        notes += ("- CHECK RULE 2: this query has no period filter. If the user did NOT name a period, run the "
-                  "query again with JOIN orders ... AND orders.in_trend_period = 1, and answer from that result.\n")
+        notes += ("- CHECK RULE 2: this query has no period filter. If the user did NOT name a period and did not "
+                  "ask about the whole dataset, run the query again with JOIN orders ... AND "
+                  "orders.in_trend_period = 1, and answer from that result.\n")
     return f"{table}\n\nNOTES FOR THE ANSWER:\n{notes}"
 
 
@@ -265,7 +283,7 @@ def build_sql_agent(llm, scope, language, state, verbose=False):
     """Satukan LLM, tool run_sql dan instruksi menjadi agent LangChain (dibuat ulang per pertanyaan,
     karena scope dan bahasa jawaban berbeda per login / pertanyaan)."""
     system_prompt = "\n\n".join([
-        RULES.format(schema=get_schema()),
+        RULES.format(schema=get_schema(public_only=scope.role == "customer")),
         ANSWER_RULES.format(language=language) + ("\n" + INDONESIAN_TERMS if "indones" in language.lower() else ""),
     ])
     return create_agent(llm, [make_sql_tool(scope, state, verbose)], system_prompt=system_prompt, name="sql_agent")
@@ -333,32 +351,11 @@ def ask_sql_agent(question, role="company", llm=None, verbose=True, language=Non
 # Role dan id TIDAK boleh menjadi argumen tool: argumen tool diisi oleh LLM supervisor, jadi bisa dibelokkan
 # lewat prompt ("saya sebenarnya staf company"). Karena itu tool dibuat per sesi login (closure): role dan id
 # dikunci saat tool dibuat, dan LLM hanya bisa mengisi pertanyaannya.
-def get_customer_categories(scope, limit=3):
-    """Kategori yang paling sering dibeli customer yang login (order terkirim saja). DataFrame, bisa kosong.
-    Dijalankan lewat run_query dengan scope customer, jadi hanya bisa membaca riwayat customer itu sendiri."""
-    if scope.role != "customer":
-        raise PermissionError("Purchase history is only available to the logged-in customer.")
-    sql = f"""
-        SELECT p.product_category_name_english AS category,
-               COUNT(*)                         AS items_bought,
-               MAX(o.order_purchase_timestamp)  AS last_bought
-        FROM orders o
-        JOIN order_items oi ON oi.order_id = o.order_id
-        JOIN products p     ON p.product_id = oi.product_id
-        WHERE o.is_delivered = 1
-          AND p.product_category_name_english != 'uncategorized'
-        GROUP BY category
-        ORDER BY items_bought DESC, last_bought DESC
-        LIMIT {int(limit)}
-    """
-    return run_query(sql, scope=scope)
 
-
-# Halaman login hanya memilih role + password (tanpa id), jadi seller dan customer memakai SATU akun demo
-# per role. Id-nya dari .env (bisa diganti tanpa mengubah kode); default = akun yang sudah dicek ada datanya.
+# Akun demo seller untuk CLI / tes tanpa halaman login. Id-nya dari .env (bisa diganti tanpa mengubah kode).
+# Customer tidak punya akun demo: customer selalu pembeli anonim (lihat agent/policy.py).
 DEMO_USER_IDS = {
     "seller": os.getenv("DEMO_SELLER_ID", "d91fb3b7d041e83b64a00a3edfb37e4f"),         # 535 order
-    "customer": os.getenv("DEMO_CUSTOMER_ID", "02e9109b7e0a985108b43e573b6afb23"),     # 3 order terkirim
 }
 
 
@@ -370,11 +367,9 @@ def demo_user_id(role):
 
 def make_data_tools(role, user_id=None):
     """Buat tool data untuk SATU sesi login. role (dan user_id) diambil dari halaman login, bukan dari LLM.
-    Tanpa user_id, seller/customer memakai akun demo role itu (demo_user_id).
+    Tanpa user_id, seller memakai akun demo (demo_user_id); customer selalu anonim.
 
-    Mengembalikan list tool untuk supervisor:
-      - ask_data_agent(question)              -> semua role
-      - customer_past_categories()            -> hanya role customer (riwayat kategori miliknya sendiri)
+    Mengembalikan [ask_data_agent(question)] untuk supervisor.
     Raise ValueError kalau login tidak valid (role tidak dikenal, id demo tidak ada di database), supaya aplikasi
     menolak sejak awal.
     """
@@ -397,24 +392,4 @@ def make_data_tools(role, user_id=None):
             return f"The data agent failed: {type(error).__name__}: {str(error)[:200]}"
         return result["answer"]
 
-    tools = [ask_data_agent]
-
-    if scope.role == "customer":
-        @tool
-        def customer_past_categories() -> str:
-            """Return the product categories the logged-in customer bought before (most bought first), for
-            recommendations. Use the English category names it returns as product_category in the review
-            specialist's search."""
-            try:
-                data = get_customer_categories(scope)
-            except Exception as error:
-                return f"Could not read the purchase history: {type(error).__name__}: {str(error)[:200]}"
-            if data.empty:
-                return "No delivered orders found for this customer."
-            lines = [f"- {row.category} ({row.items_bought} item(s), last bought {row.last_bought[:10]})"
-                     for row in data.itertuples()]
-            return "This customer bought before:\n" + "\n".join(lines)
-
-        tools.append(customer_past_categories)
-
-    return tools
+    return [ask_data_agent]

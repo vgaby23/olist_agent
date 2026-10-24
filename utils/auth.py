@@ -7,7 +7,8 @@ DB = {
     "admin" :{"password": "admin123", "role": "company"}
 }
 
-# customer: top level review -> (di supervisor)forbidden actions: 
+# Seller login dengan seller ID. Customer = pembeli anonim (tanpa ID); aturan apa yang boleh/dilarang
+# per role ada di agent/policy.py.
 
 def verify_login():
     account = st.session_state.get("login_account")
@@ -19,7 +20,7 @@ def verify_login():
 
     role = DB[account]["role"]
     user_id = (st.session_state.get("login_user_id") or "").strip().lower()
-    if role in {"seller", "customer"}:
+    if role == "seller":
         if not user_id:
             st.error(f"Enter your {role} ID to continue.")
             return
@@ -35,7 +36,7 @@ def verify_login():
     st.session_state["logged_in"] = True
     st.session_state["username"] = account
     st.session_state["role"] = role
-    st.session_state["agent_id"] = user_id if role in {"seller", "customer"} else None
+    st.session_state["agent_id"] = user_id if role == "seller" else None
     st.session_state["login_user_id"] = ""
     st.session_state["password"] = ""
 
@@ -48,6 +49,7 @@ def logout():
     st.session_state['password'] = ""
     st.session_state['conversations'] = {}
     st.session_state['messages'] = []
+    st.session_state['pending_prompt'] = None
 
 def login_page():
     if not st.session_state.get("logged_in"):
@@ -56,8 +58,8 @@ def login_page():
         users = list(DB.keys())
         account = st.selectbox("Role", options=users, index=0, key="login_account")
         role = DB[account]["role"]
-        if role in {"seller", "customer"}:
-            st.text_input(f"{role.title()} ID", key="login_user_id")
+        if role == "seller":
+            st.text_input("Seller ID", key="login_user_id")
         st.text_input("Password", type="password", key="password")
         st.button("Login", on_click=verify_login)
     else:

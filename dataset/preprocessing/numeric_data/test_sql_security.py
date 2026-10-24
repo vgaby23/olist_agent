@@ -8,13 +8,13 @@ Jalankan dari folder utama proyek:
     python -m dataset.preprocessing.numeric_data.test_sql_security
 """
 import inspect
-from types import SimpleNamespace
 
 from dataset.preprocessing.numeric_data.sql_tools import get_monthly_revenue, make_scope, run_query, validate_query
 
 SELLER = "4869f7a5dfa277a7dca6462dcf3b52b2"        # seller dengan revenue tertinggi
 OTHER_SELLER = "53243585a1d6dc2643021fd1853d8905"  # seller lain
-CUSTOMER = "8d50f5eadf50201ccdcedfb9e2ac8455"      # customer dengan order terbanyak
+REAL_CUSTOMER = "8d50f5eadf50201ccdcedfb9e2ac8455" # customer_unique_id asli (tidak boleh terlihat oleh seller)
+PRIVATE_TABLES = ["orders", "order_items", "order_payments", "order_reviews", "customers", "sellers"]
 
 REVENUE = ("SELECT ROUND(SUM(oi.price), 2) AS revenue, COUNT(DISTINCT oi.seller_id) AS sellers "
            "FROM order_items oi JOIN orders o ON o.order_id = oi.order_id "
@@ -51,13 +51,14 @@ check("fungsi replace() tetap boleh", value("SELECT replace('ab','a','c')") == "
 
 # ---------------------------------------------------------------- 2. scope / login
 check("seller tanpa id ditolak", raises(make_scope, "seller") is not None)
-check("customer tanpa id ditolak", raises(make_scope, "customer", "") is not None)
+check("customer anonim: tanpa id boleh", make_scope("customer").user_id is None)
+check("customer anonim: id yang dikirim diabaikan", make_scope("customer", REAL_CUSTOMER).user_id is None)
 check("id dengan SQL injection ditolak", raises(make_scope, "seller", "x' OR 1=1 --") is not None)
 check("id yang tidak ada ditolak", raises(make_scope, "seller", "0" * 32) is not None)
 check("role tidak dikenal ditolak", raises(make_scope, "admin") is not None)
 
 seller = make_scope("seller", SELLER)
-customer = make_scope("customer", CUSTOMER)
+customer = make_scope("customer")
 
 company_rev = run_query(REVENUE).iloc[0]
 check("company: revenue semua seller (2017-01..2018-08)", company_rev.revenue == 13179777.95, company_rev.revenue)
@@ -75,11 +76,40 @@ bypass = raises(run_query, 'SELECT COUNT(*) FROM "main"."order_items"', seller)
 check("seller: bypass lewat \"main\".\"order_items\" ditolak authorizer", bypass is not None, bypass)
 check("company: \"main\".\"order_items\" boleh", value('SELECT COUNT(*) FROM "main"."order_items"') == 112650)
 
-check("customer: hanya order miliknya",
-      value("SELECT COUNT(DISTINCT customer_unique_id) FROM customers", customer) == 1)
-check("customer: order_items hanya dari ordernya",
-      value("SELECT COUNT(*) FROM order_items oi LEFT JOIN orders o ON o.order_id = oi.order_id "
-            "WHERE o.order_id IS NULL", customer) == 0)
+# customer anonim (aturan C1-C5 di agent/policy.py): tabel transaksi tertutup, hanya agregat umum
+for table in PRIVATE_TABLES:
+    check(f"customer: SELECT kolom {table} ditolak", raises(run_query, f"SELECT * FROM {table} LIMIT 1", customer))
+    # COUNT(*) tidak membaca kolom; SQLite melaporkannya dengan db_name None (celah lama di authorizer)
+    check(f"customer: COUNT(*) {table} ditolak", raises(run_query, f"SELECT COUNT(*) FROM {table}", customer))
+check("customer: subquery ke tabel tertutup ditolak", raises(
+    run_query, "SELECT category FROM category_stats WHERE category IN (SELECT seller_id FROM sellers)", customer))
+check("customer: products & br_states tetap terbuka", value("SELECT COUNT(*) FROM products", customer) == 32951
+      and value("SELECT COUNT(*) FROM br_states", customer) == 27)
+check("customer: category_stats terbuka", value("SELECT COUNT(*) FROM category_stats", customer) > 50)
+# C5: items_sold x avg_price yang persis = omzet platform; customer hanya dapat rentang kasar
+check("customer: items_sold/avg_price/review_count persis tidak ada",
+      all(raises(run_query, f"SELECT SUM({col}) FROM {view}", customer) is not None
+          for col in ("items_sold", "avg_price", "review_count") for view in ("category_stats", "product_stats")))
+check("customer: urutan penjualan tetap ada", run_query(
+    "SELECT category FROM category_stats WHERE sales_rank = 1", customer).iloc[0, 0] == "bed_bath_table")
+check("customer: product_stats terbuka", value("SELECT COUNT(*) FROM product_stats", customer) > 30_000)
+check("customer: state_delivery_stats terbuka", value("SELECT COUNT(*) FROM state_delivery_stats", customer) == 27)
+
+# seller: pembeli tanpa id asli & tanpa kode pos (aturan S3), agregat tetap benar
+cols = list(run_query("SELECT * FROM customers LIMIT 1", seller).columns)
+check("seller: customers tanpa kode pos", "customer_zip_code_prefix" not in cols, cols)
+ids = run_query("SELECT customer_id, customer_unique_id FROM customers LIMIT 5", seller)
+check("seller: id pembeli berupa pseudonim", all(v.startswith("cust_") for v in ids.values.ravel()), ids.values.tolist())
+check("seller: id pembeli asli tidak bisa dicari",
+      value(f"SELECT COUNT(*) FROM customers WHERE customer_unique_id = '{REAL_CUSTOMER}'", seller) == 0)
+check("seller: pseudonim cocok di JOIN orders-customers", value(
+    "SELECT COUNT(*) FROM orders o JOIN customers c ON c.customer_id = o.customer_id", seller)
+      == value("SELECT COUNT(*) FROM orders", seller))
+true_buyers = value(f"""SELECT COUNT(DISTINCT c.customer_unique_id) FROM orders o
+    JOIN customers c ON c.customer_id = o.customer_id
+    WHERE o.order_id IN (SELECT order_id FROM order_items WHERE seller_id = '{SELLER}')""")   # company scope
+check("seller: jumlah pembeli unik sama dengan data asli",
+      value("SELECT COUNT(DISTINCT customer_unique_id) FROM customers", seller) == true_buyers, true_buyers)
 
 # ---------------------------------------------------------------- 3. batas baris & waktu
 cats = run_query("SELECT DISTINCT product_category_name_english FROM products")
@@ -141,31 +171,65 @@ check("most-loved categories (se-platform)", len(loved) == 3, loved.to_dict("rec
 
 # ---------------------------------------------------------------- 5. alur ask_sql_agent dengan LLM palsu
 try:
-    from agent.sql_agent import ask_sql_agent, get_customer_categories, make_data_tools, period_note
+    from agent.sql_agent import ask_sql_agent, make_data_tools, period_note
+    from dataset.preprocessing.numeric_data.sql_tools import get_schema
 except ImportError as error:
     print(f"[SKIP] tes agent: {error}")
 else:
-    class FakeLLM:
-        """Mengembalikan jawaban berurutan; mencatat prompt yang diterima."""
-        def __init__(self, replies):
-            self.replies, self.prompts = list(replies), []
+    from langchain_core.language_models import BaseChatModel
+    from langchain_core.messages import AIMessage, ToolMessage
+    from langchain_core.outputs import ChatGeneration, ChatResult
+    from pydantic import Field
 
-        def invoke(self, messages):
+    class FakeLLM(BaseChatModel):
+        """Chat model palsu untuk agent LangChain: mengembalikan jawaban berurutan dan mencatat prompt yang
+        diterima. Jawaban berupa teks biasa, atau AIMessage dengan tool_calls (lihat sql_call)."""
+        replies: list
+        prompts: list = Field(default_factory=list)
+
+        @property
+        def _llm_type(self):
+            return "fake"
+
+        def bind_tools(self, tools, **kwargs):
+            return self
+
+        def _generate(self, messages, stop=None, run_manager=None, **kwargs):
             self.prompts.append(messages)
-            return SimpleNamespace(content=self.replies.pop(0))
+            reply = self.replies.pop(0)
+            message = reply if isinstance(reply, AIMessage) else AIMessage(content=reply)
+            return ChatResult(generations=[ChatGeneration(message=message)])
 
-    llm = FakeLLM(["SELECT ROUND(SUM(oi.price),2) AS revenue FROM order_items oi "
-                   "JOIN orders o ON o.order_id = oi.order_id WHERE o.is_delivered = 1",
-                   "Total pendapatan: R$ 226.987,93"])
+    call_ids = iter(range(1000))
+
+    def sql_call(sql):
+        """Balasan LLM yang memanggil tool run_sql dengan SQL ini (id tool call harus unik)."""
+        return AIMessage(content="", tool_calls=[{"name": "run_sql", "args": {"query": sql}, "id": f"call_{next(call_ids)}"}])
+
+    llm = FakeLLM(replies=[sql_call("SELECT ROUND(SUM(oi.price),2) AS revenue FROM order_items oi "
+                                    "JOIN orders o ON o.order_id = oi.order_id WHERE o.is_delivered = 1"),
+                           "Total pendapatan: R$ 226.987,93"])
     out = ask_sql_agent("Berapa total pendapatan semua seller?", role="seller", user_id=SELLER,
                         llm=llm, verbose=False, language="Indonesian")
     check("agent: SQL LLM dijalankan dengan scope seller", out["data"].iloc[0, 0] == 226987.93)
+    check("agent: jawaban akhir dari LLM", out["answer"] == "Total pendapatan: R$ 226.987,93")
 
-    llm = FakeLLM(['SELECT COUNT(*) FROM "main"."order_items"', "SELECT COUNT(*) FROM order_items", "ok"])
+    llm = FakeLLM(replies=[sql_call('SELECT COUNT(*) FROM "main"."order_items"'),
+                           sql_call("SELECT COUNT(*) FROM order_items"), "ok"])
     out = ask_sql_agent("count items", role="seller", user_id=SELLER, llm=llm, verbose=False, language="English")
     check("agent: SQL bypass ditolak lalu diperbaiki LLM", out["data"].iloc[0, 0] < 112650 and out["error"] is None)
 
-    llm = FakeLLM(["You need to log in as a seller first."])
+    llm = FakeLLM(replies=[sql_call("SELECT nope FROM nowhere") for _ in range(3)] + ["I could not do it."])
+    out = ask_sql_agent("broken", llm=llm, verbose=False, language="English")
+    check("agent: berhenti setelah 3 SQL gagal", out["error"] and out["data"] is None and not llm.replies,
+          out["error"])
+
+    llm = FakeLLM(replies=["Sorry, the database has no profit data."])
+    out = ask_sql_agent("What is my profit?", llm=llm, verbose=False, language="English")
+    check("agent: pertanyaan di luar database -> jawab tanpa SQL", out["sql"] is None and out["error"] is None
+          and "profit" in out["answer"])
+
+    llm = FakeLLM(replies=["You need to log in as a seller first."])
     out = ask_sql_agent("my revenue?", role="seller", llm=llm, verbose=False, language="English")
     check("agent: seller tanpa id -> menolak tanpa menjalankan SQL", out["sql"] is None and out["error"])
 
@@ -177,13 +241,15 @@ else:
     check("periode: SQL dengan periode dari pengguna -> catatan parsial",
           "partial" in period_note("... WHERE o.purchase_year = 2016"))
 
-    llm = FakeLLM(["SELECT s.seller_city, ROUND(SUM(oi.price),2) AS revenue FROM order_items oi "
-                   "JOIN sellers s ON s.seller_id = oi.seller_id GROUP BY 1 ORDER BY 2 DESC LIMIT 3", "ok"])
+    llm = FakeLLM(replies=[sql_call("SELECT s.seller_city, ROUND(SUM(oi.price),2) AS revenue FROM order_items oi "
+                                    "JOIN sellers s ON s.seller_id = oi.seller_id GROUP BY 1 ORDER BY 2 DESC LIMIT 3"),
+                           "ok"])
     ask_sql_agent("Top 3 seller cities by revenue?", llm=llm, verbose=False, language="English")
-    summary = llm.prompts[-1][0][1]
-    check("agent: ringkasan tanpa filter periode tidak mengklaim 2017-2018",
-          "all available data" in summary and "January 2017 to August 2018 (the default" not in summary)
-    check("agent: ringkasan meminta nama kota disalin persis", "EXACTLY" in summary)
+    last_prompt = llm.prompts[-1]               # prompt saat LLM menulis jawaban akhir
+    tool_result = next(m.content for m in last_prompt if isinstance(m, ToolMessage))
+    check("agent: hasil tanpa filter periode tidak mengklaim 2017-2018",
+          "all available data" in tool_result and "January 2017 to August 2018 (the default" not in tool_result)
+    check("agent: instruksi meminta nama kota disalin persis", "EXACTLY" in last_prompt[0].content)
 
     # tool per sesi login: role & id dikunci, LLM hanya mengisi pertanyaan
     def tool_name(t):
@@ -200,20 +266,17 @@ else:
     check("tool: argumen hanya 'question' (tidak ada role/user_id)", tool_args(seller_tools[0]) == {"question"})
     check("tool: login seller tanpa id ditolak saat tool dibuat", raises(make_data_tools, "seller") is not None)
 
-    customer_tools = {tool_name(t): t for t in make_data_tools("customer", CUSTOMER)}
-    history = customer_tools.get("customer_past_categories")
-    check("tool customer: customer_past_categories tanpa argumen", history is not None and tool_args(history) == set())
-    text = call(history)
-    check("tool customer: riwayat kategori miliknya sendiri", text.startswith("This customer bought before"), text)
-    check("riwayat kategori: role selain customer ditolak",
-          raises(get_customer_categories, make_scope("seller", SELLER)) is not None)
-    check("riwayat kategori: hasil sama dengan query manual customer itu",
-          get_customer_categories(customer).category.tolist()
-          == run_query("SELECT p.product_category_name_english AS c, COUNT(*) n, MAX(o.order_purchase_timestamp) t "
-                       "FROM orders o JOIN order_items oi ON oi.order_id = o.order_id "
-                       "JOIN products p ON p.product_id = oi.product_id WHERE o.is_delivered = 1 "
-                       "AND p.product_category_name_english != 'uncategorized' GROUP BY c "
-                       "ORDER BY n DESC, t DESC LIMIT 3", customer).c.tolist())
+    customer_tools = make_data_tools("customer")
+    check("tool customer anonim: hanya ask_data_agent", [tool_name(t) for t in customer_tools] == ["ask_data_agent"])
+    public = get_schema(public_only=True)
+    check("skema customer: tanpa tabel transaksi",
+          all(f"TABLE {t}:" not in public for t in PRIVATE_TABLES) and "product_stats" in public, public[:80])
+
+    llm = FakeLLM(replies=[sql_call("SELECT COUNT(*) FROM orders"),
+                           sql_call("SELECT COUNT(*) FROM category_stats"), "ok"])
+    out = ask_sql_agent("how many orders?", role="customer", llm=llm, verbose=False, language="English")
+    check("agent customer: tabel orders ditolak, LLM pindah ke agregat umum",
+          out["data"] is not None and out["sql"].endswith("FROM category_stats") and out["error"] is None)
 
 print(f"\n{sum(results)}/{len(results)} PASS")
 raise SystemExit(0 if all(results) else 1)
