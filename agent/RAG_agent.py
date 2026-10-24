@@ -7,15 +7,20 @@ WHAT IT DOES
     bad rating. It searches the review comments in Qdrant (through rag_core.py) and writes a short
     answer with example quotes. It does NOT do numbers (counts, averages): that is the SQL agent's job.
 
-HOW THE SUPERVISOR USES IT   (note for the teammate who builds the supervisor)
-    The simplest way: make the tool for the login session (role from the login page, like make_data_tools
-    in sql_agent.py). The role is locked inside the tool, so the supervisor's LLM cannot change it:
+HOW THE SUPERVISOR USES IT
+    The supervisor passes a role-scoped review agent to LangGraph's create_supervisor:
 
-        from agent.RAG_agent import make_review_tools
-        tools = make_review_tools(role, user_id) + make_data_tools(role, user_id)
-        supervisor = create_agent(llm, tools, system_prompt=...)
+        from agent import rag_agent, sql_agent
+        review_agent = rag_agent.build_rag_agent(llm, role=role, user_id=user_id)
+        data_agent = sql_agent.make_data_tools(role, user_id)
+        supervisor = create_supervisor(
+            agents=[review_agent, data_agent], model=llm, prompt=SUPERVISOR_PROMPT
+        ).compile()
 
-    Or call it as a normal function (question in, text out, no memory between calls):
+    build_rag_agent() returns a specialist agent. Company sessions can search platform-wide reviews;
+    seller sessions are forced to their own seller ID, and customer sessions are restricted to their
+    own order IDs by a wrapper around the search tool. Those constraints are enforced in code.
+    To call the review agent directly (question in, text out, no memory between calls):
 
         from agent.RAG_agent import ask_rag_agent
         text = ask_rag_agent("What do customers complain about in health_beauty?", role="customer")
@@ -104,9 +109,7 @@ def is_general_query(query):
 THIS_FOLDER = Path(__file__).resolve().parent
 
 from agent.language import guess_language
-from agent.sql_agent import demo_user_id
-from data_preprocessing.numeric_data.sql_tools import Scope, make_scope, run_query
-from data_preprocessing.vector_data import rag_core
+from dataset.preprocessing.vector_data import rag_core
 
 def add_language_hint(question):
     """Add one sentence telling the agent which language the user wrote in.
@@ -454,14 +457,13 @@ LANGUAGE (the most important rule)
 - Copy the product category ("category: ...") and the seller city ("city: ...") exactly as given in the
   search results. Do not translate or guess them. If an order has several categories, show all of them.
 
-Example, question in Bahasa Indonesia (answer_language "Bahasa Indonesia"):
-  Berikut beberapa review tentang produk rusak:
-  1. "produto deu defeito na 1 vez de uso." -> "produk rusak pada pemakaian pertama." (rating 1/5, category: health_beauty, city: sao paulo, order_id abc123)
-  Review-review ini menunjukkan ketidakpuasan terhadap kualitas produk.
+Example, question in Bahasa Indonesia (answer_language "Bahasa Indonesia"):    Berikut beberapa ulasan tentang produk rusak:
+    1. "produk rusak pada pemakaian pertama." (rating 1/5, category: health_beauty, city: sao paulo, order_id abc123)
+    Ulasan-ulasan ini menunjukkan ketidakpuasan terhadap kualitas produk.
 
 Example, question in English (answer_language "English"):
   Here are some reviews about damaged products:
-  1. "produto deu defeito na 1 vez de uso." -> "the product broke on the first use." (rating 1/5, category: health_beauty, city: sao paulo, order_id abc123)
+    1. "the product broke on the first use." (rating 1/5, category: health_beauty, city: sao paulo, order_id abc123)
   These reviews show dissatisfaction with product quality.
 
 HOW TO WORK
@@ -527,8 +529,8 @@ def make_role_note(scope):
 def build_rag_agent(llm=None, scope=None):
     """Put the LLM, the tool and the instructions together. Returns the agent.
 
-    `llm` is optional: normally we create the OpenAI model here. (The tests pass in a fake one.)
-    `scope` is the login (sql_tools.make_scope); without one the agent sees everything (company).
+    `llm` is optional: normally we create the OpenAI model here. Seller/customer tools are scoped
+    to their authenticated records; company review search remains platform-wide.
     """
     if llm is None:
         llm = ChatOpenAI(model=LLM_MODEL, temperature=0)      # temperature 0 = least random answers
@@ -581,21 +583,21 @@ def ask_rag_agent(question, show_steps=False, role="company", user_id=None):
 
 # The same function, packaged as a TOOL, so a supervisor agent can use it directly.
 # (Again the docstring is what the supervisor's LLM reads.)
-# Like make_data_tools in sql_agent.py, the tool is made per login: role and id are NOT tool arguments,
-# because the supervisor's LLM fills those in and could be talked into "I am actually company staff".
-def make_review_tools(role, user_id=None):
-    """Create the review tool for ONE login session. Returns [ask_review_agent].
-    Raises ValueError when the login is not valid, so the app refuses from the start."""
-    scope = make_scope(role, user_id or demo_user_id(role))
+@tool
+def ask_review_agent(question: str) -> str:
+    """Ask the review specialist what customers say: complaints, praise, reasons for a rating.
 
-    @tool
-    def ask_review_agent(question: str) -> str:
-        """Ask the review specialist what customers say: complaints, praise, reasons for a rating.
+    It searches Portuguese review comments and returns a summary with example quotes in the requested
+    answer language, plus rating, product category, seller city and order_id. It shows Portuguese source
+    text only when Portuguese is the requested answer language.
+    It cannot count or average anything.
 
-        It searches the Portuguese review comments and returns a summary with example quotes, each shown
-        in the original Portuguese AND in a translation (with rating, product category, seller city and order_id).
-        It cannot count or average anything. The reviews are automatically limited to what the logged-in user
-        may see.
+    Arguments:
+        question: a complete, self-contained question. ALWAYS say which language the answer must be in
+            (the language the user wrote in), e.g.
+            "What do customers complain about in the health_beauty category (rating 1-2)? Answer in Bahasa Indonesia."
+    """
+    return ask_rag_agent(question)
 
         Arguments:
             question: a complete, self-contained question. ALWAYS say which language the answer must be in

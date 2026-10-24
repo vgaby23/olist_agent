@@ -20,6 +20,12 @@ LANGUAGE_WORDS = {
                       "alguma tem entrega pedido são sao é foi".split()),
 }
 
+EXPLICIT_LANGUAGE = re.compile(
+    r"\b(?:(?:answer|respond|reply)\s+in|answer\s+language\s*:)\s*"
+    r"(english|bahasa\s+indonesia|indonesian|portuguese)\b",
+    re.IGNORECASE,
+)
+
 
 def guess_language(text):
     """"What do customers say?" -> "English". Returns None when it is not clear.
@@ -30,3 +36,14 @@ def guess_language(text):
     best = max(scores.values())
     winners = [language for language, score in scores.items() if score == best]
     return winners[0] if best > 0 and len(winners) == 1 else None
+
+
+def answer_language(text, default="English"):
+    """Resolve a supported explicit language request, then detect text language, then use a default."""
+    explicit = EXPLICIT_LANGUAGE.search(text or "")
+    if explicit:
+        language = explicit.group(1).lower()
+        if language in {"bahasa indonesia", "indonesian"}:
+            return "Bahasa Indonesia"
+        return language.title()
+    return guess_language(text or "") or default

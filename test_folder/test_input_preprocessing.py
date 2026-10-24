@@ -1,7 +1,7 @@
 """Tests for input_preprocessing.py. OpenAI is never called: the two AI steps are replaced by fakes."""
 import pytest
 
-import input_preprocessing as pre
+import utils.input_preprocessing as pre
 
 
 @pytest.fixture(autouse=True)
@@ -107,10 +107,10 @@ def test_silent_audio_is_an_error(files, monkeypatch):
 
 
 def test_ask_with_media_sends_the_question_to_the_agent(files, monkeypatch):
-    from agent import RAG_agent
+    from agent import rag_agent
     monkeypatch.setattr(pre, "image_to_guess", fake_guess())
     sent = []
-    monkeypatch.setattr(RAG_agent, "ask_rag_agent", lambda q, show_steps=False: sent.append(q) or "answer")
+    monkeypatch.setattr(rag_agent, "ask_rag_agent", lambda q, show_steps=False: sent.append(q) or "answer")
     assert pre.ask_with_media(image_path=files[0]) == "answer"
     assert "red toy car" in sent[0]
 
