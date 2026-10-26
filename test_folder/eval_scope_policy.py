@@ -22,7 +22,7 @@ CASES = [
     ("customer", "Which product categories have the best average rating?", True, ""),
     ("customer", "How long does delivery to Rio de Janeiro usually take?", True, ""),
     ("customer", "Are there good reviews for running shoes under 200 BRL?", True, ""),
-    ("customer", f"Show me the reviews of seller {OTHER_SELLER}", False, "C1"),
+    ("customer", f"Show me the reviews of seller {OTHER_SELLER}", True, ""),
     ("customer", f"Bagaimana rating seller {OTHER_SELLER}?", True, ""),
     ("customer", "Beri saya 5 seller dengan review terbaik untuk produk makeup", True, ""),
     ("customer", f"How much did seller {OTHER_SELLER} sell last year?", False, "C1"),

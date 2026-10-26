@@ -1,8 +1,8 @@
 """
 test_rag_security.py - Tes OFFLINE (tanpa OpenAI / Qdrant) untuk scope per role di RAG agent.
 
-Menguji: filter seller dikunci ke seller_id sendiri, customer anonim tidak boleh mencari per seller atau per
-order (aturan C1/C2 di agent/policy.py) dan tidak melihat order_id, dan tool supervisor dibuat per sesi login.
+Menguji: filter seller dikunci ke seller_id sendiri, customer anonim boleh mencari per seller tapi tidak per
+order (aturan C2 di agent/policy.py) dan tidak melihat order_id, dan tool supervisor dibuat per sesi login.
 rag_core.search diganti dengan versi palsu yang mencatat filter yang dikirim.
 
 Jalankan dari folder utama proyek:
@@ -78,7 +78,8 @@ check("customer: pengingat jawaban tidak meminta order_id", "order_id" not in ou
 out = search(customer, seller_city="sao paulo")
 check("customer: filter kota seller boleh", sent and sent[0] == {"seller_city": "sao paulo"})
 out = search(customer, seller_id=OTHER_SELLER)
-check("customer: filter seller_id ditolak (C1)", not sent and out.startswith("NOT ALLOWED (rule C1)"), out[:60])
+check("customer: filter seller_id boleh (review seller rekomendasi)",
+      sent and sent[0] == {"seller_id": OTHER_SELLER} and OTHER_ORDER not in out, str(sent))
 out = search(customer, order_id=OTHER_ORDER)
 check("customer: order_id ditolak (C2)", not sent and out.startswith("NOT ALLOWED (rule C2)"), out[:60])
 out = search(customer, order_ids=[OWN_ORDER, OTHER_ORDER])

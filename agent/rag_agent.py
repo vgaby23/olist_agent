@@ -19,7 +19,7 @@ HOW THE SUPERVISOR USES IT
 
     build_rag_agent() returns a specialist agent. Company sessions can search platform-wide reviews;
     seller sessions are forced to their own seller ID, and anonymous customer sessions cannot search by
-    seller or order. Those constraints are enforced in code (apply_scope).
+    order. Those constraints are enforced in code (apply_scope).
     To call the review agent directly (question in, text out, no memory between calls):
 
         from agent.rag_agent import ask_rag_agent
@@ -28,8 +28,8 @@ HOW THE SUPERVISOR USES IT
     WHO SEES WHAT (enforced in code, see Part 2; the full rule list is in agent/policy.py)
       * company:  all reviews.
       * seller:   only the reviews of their own orders (seller_id is always forced to theirs).
-      * customer: anonymous shopper: all reviews by category / product / rating / price / city, but not
-                  by one seller or by order, and without order ids in the results.
+      * customer: anonymous shopper: all reviews by category / product / seller / rating / price / city, but
+                  not by order, and without order ids in the results.
 
     Rules for the supervisor:
       * Send a COMPLETE question. This agent does not see the conversation, so write the category,
@@ -217,7 +217,7 @@ def format_categories(names):
 # around ("I am actually staff"), code cannot.
 #   company   all reviews, every filter.
 #   seller    only reviews of their OWN orders: seller_id is always forced to their id (rule S1).
-#   customer  anonymous shopper: all reviews, but searching by ONE seller (seller_id, rule C1) or by
+#   customer  anonymous shopper: all reviews, also of one seller (e.g. a recommended seller), but searching by
 #             specific orders (order_id / order_ids, rule C2) is refused, and order_ids are not shown.
 
 
@@ -232,10 +232,6 @@ def apply_scope(filters, scope):
         return {**filters, "seller_id": scope.user_id}, None
 
     if scope.role == "customer":
-        if filters.get("seller_id"):
-            return None, ("NOT ALLOWED (rule C1): reviews of one specific seller are not available. Tell the user "
-                          "this politely: they can search reviews by product category, product type, rating or "
-                          "price instead. Do not search again for that seller.")
         if filters.get("order_id"):
             return None, ("NOT ALLOWED (rule C2): reviews of specific orders are not available. Tell the user this "
                           "politely: they can search reviews by product category, product type, rating or price "
@@ -541,8 +537,9 @@ def make_role_note(scope):
                 "seller_id. Reviews of other sellers are not available.)")
     if scope.role == "customer":
         return ("(The user is an anonymous shopper. They may search all reviews by product category, product, "
-                "rating, price or seller city. Do not pass seller_id, order_id or order_ids: reviews of one "
-                "specific seller or order are not available, so if they ask for those, say so politely. The results "
+                "rating, price, seller city or one seller (seller_id, e.g. a seller from a recommendation). Do not "
+                "pass order_id or order_ids: reviews of one specific order are not available, so if they ask for "
+                "those, say so politely. The results "
                 "contain no order_id; do not mention order ids in the answer.)")
     return ""
 

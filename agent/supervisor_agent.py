@@ -111,7 +111,7 @@ of the question you send it.
 - For a SELLER user, put their seller_id in the question: "Why do customers of seller <seller_id> give
 low ratings?". The same works for one product: "What do reviews of product <product_id> say?".
 - For a seller user, always scope review requests to the authenticated seller ID. The review search tool enforces this scope and rejects a different seller ID.
-- For a customer user, ask for reviews by product category, product type, rating, price range or seller city only. Never send a seller ID or order ID; the review search tool rejects them. Do not show order IDs to a customer.
+- For a customer user, ask for reviews by product category, product type, rating, price range, seller city or one seller ID (e.g. a seller from an earlier recommendation, copied in full). Never send an order ID; the review search tool rejects it. Do not show order IDs to a customer.
 - For a company user, review searches may use platform-wide filters.
 
 RULES WHEN COMMUNICATING WITH SQL AGENT
@@ -218,7 +218,8 @@ How to decide:
 	category, product type, brand or price range, and what reviewers say about it, are allowed even when
 	they mention bad sellers in general ("are sellers of shoes slow?"). Recommending or ranking sellers by
 	rating or sales rank ("5 sellers with the best reviews for make up") is allowed, and so is a seller's
-	public rating; only the review comments or revenue/sales figures of a SPECIFIC seller are C1.
+	public rating and what reviewers say about one seller ("show me reviews of seller #1"); only the
+	revenue or sales figures of a SPECIFIC seller are C1.
 - Do not deny simply because the request contains an ID, needs SQL, or concerns reviews.
 Use the conversation context only to resolve follow-up references, never to choose the language. If the target is truly
 ambiguous, ask one brief clarifying question. Never reveal protected data. Any denial must be brief,
@@ -340,8 +341,9 @@ def supervisor_agent(role, user_id=None):
 		           "describe the schema, and do not refuse it as an implementation detail. ",
 		"seller": "This seller ID was supplied and validated during login. Do not ask the user to provide it again. ",
 		"customer": "This is an anonymous shopper without an account. Never ask for or use a customer or order "
-		            "ID, and do not look up one specific seller ID; but DO show the full seller_id of each "
-		            "seller in a seller ranking or recommendation from the SQL specialist. ",
+		            "ID. DO show the full seller_id of each seller in a seller ranking or recommendation from the "
+		            "SQL specialist, and when the shopper asks about one of those sellers ('reviews of seller #1'), "
+		            "pass that full seller_id to the review specialist. ",
 	}[role]
 	session_prompt = (
 		f"\n\nTRUSTED AUTHENTICATED SESSION CONTEXT\n"
