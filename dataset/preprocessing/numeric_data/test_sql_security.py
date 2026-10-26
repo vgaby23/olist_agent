@@ -93,6 +93,19 @@ check("customer: items_sold/avg_price/review_count persis tidak ada",
 check("customer: urutan penjualan tetap ada", run_query(
     "SELECT category FROM category_stats WHERE sales_rank = 1", customer).iloc[0, 0] == "bed_bath_table")
 check("customer: product_stats terbuka", value("SELECT COUNT(*) FROM product_stats", customer) > 30_000)
+check("customer: seller_stats terbuka (rekomendasi seller)", value(
+    "SELECT COUNT(*) FROM seller_stats WHERE category = 'health_beauty' AND review_volume <> 'under 30'", customer) > 0)
+check("customer: seller_stats tanpa items_sold/avg_price/review_count persis",
+      all(raises(run_query, f"SELECT SUM({col}) FROM seller_stats", customer) is not None
+          for col in ("items_sold", "avg_price", "review_count")))
+check("customer: sales_rank seller per kategori", value(
+    "SELECT COUNT(DISTINCT category) FROM seller_stats WHERE sales_rank = 1", customer) > 50)
+# S1/S2: seller melihat agregat per produk & per seller yang sama dengan customer, benchmark kategori tetap persis
+check("seller: product_stats & seller_stats tanpa angka persis",
+      all(raises(run_query, f"SELECT SUM(items_sold) FROM {view}", seller) is not None
+          for view in ("product_stats", "seller_stats")))
+check("seller: category_stats tetap persis", value("SELECT SUM(items_sold) FROM category_stats", seller) > 100_000)
+check("company: seller_stats persis", value("SELECT SUM(items_sold) FROM seller_stats") > 100_000)
 check("customer: state_delivery_stats terbuka", value("SELECT COUNT(*) FROM state_delivery_stats", customer) == 27)
 
 # seller: pembeli tanpa id asli & tanpa kode pos (aturan S3), agregat tetap benar
@@ -268,7 +281,7 @@ else:
 
     customer_tools = make_data_tools("customer")
     check("tool customer anonim: hanya ask_data_agent", [tool_name(t) for t in customer_tools] == ["ask_data_agent"])
-    public = get_schema(public_only=True)
+    public = get_schema("customer")
     check("skema customer: tanpa tabel transaksi",
           all(f"TABLE {t}:" not in public for t in PRIVATE_TABLES) and "product_stats" in public, public[:80])
 

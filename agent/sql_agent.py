@@ -96,7 +96,9 @@ BUSINESS RULES (follow them strictly):
     Dates are TEXT 'YYYY-MM-DD HH:MM:SS'. Money is in BRL.
 16. category_stats is a ready-made, platform-wide summary per product category (all sellers). Use it for
     market or competitor comparisons by category (most-loved categories on the platform, average price, items sold).
-    product_stats is the same per product_id, state_delivery_stats gives delivery times per buyer state.
+    product_stats is the same per product_id, seller_stats per seller_id and category (use it to recommend or
+    rank sellers in a category, e.g. the best-rated sellers for make up), state_delivery_stats gives delivery
+    times per buyer state.
 17. Category names: always filter on the exact English category name (e.g. 'health_beauty'). The supervisor maps
     product types ("make up", "sepatu") to that name before asking; never invent a category name.
 
@@ -175,21 +177,24 @@ def make_role_note(scope):
                 "available. In orders, items_value/freight_total/n_items/order_total count only this seller's items, "
                 "and order_payments.payment_value is this seller's share of each payment (orders can also contain "
                 "other sellers' items). For revenue still use SUM(order_items.price). For comparisons with the "
-                "market use category_stats (platform-wide, per category).")
+                "market use category_stats (platform-wide, per category, exact). product_stats and seller_stats "
+                "are platform-wide too but, like for shoppers, show sales_rank, price_band and review_volume "
+                "instead of exact items sold, prices and review counts; never estimate other sellers' revenue.")
     if scope.role == "customer":
         return ("The user is an anonymous shopper (no account). Only the tables products and br_states and the "
-                "platform-wide views category_stats, product_stats and state_delivery_stats can be read; every "
-                "other table is blocked. Answer with these aggregates only. For shoppers, items sold and average "
-                "price are not available: use sales_rank and price_level for ordering, report price_band and "
-                "review_volume, and never estimate sales volume or revenue. Questions about one specific order, "
-                "seller or customer, seller rankings or company revenue cannot be answered: say so politely "
-                "without calling run_sql.")
+                "platform-wide views category_stats, product_stats, seller_stats and state_delivery_stats can be "
+                "read; every other table is blocked. Answer with these aggregates only. For shoppers, items sold "
+                "and average price are not available: use sales_rank and price_level for ordering, report "
+                "price_band and review_volume, and never estimate sales volume or revenue. Recommending or ranking "
+                "sellers by rating or sales_rank with seller_stats is allowed. Questions about one specific order "
+                "or customer, a seller's revenue or company revenue cannot be answered: say so politely without "
+                "calling run_sql.")
     return "The user is a company (platform) employee and can see all data."
 
 
 PERIOD_FILTER = re.compile(r"in_trend_period|purchase_month|purchase_year|order_purchase_timestamp")
 ORDER_TABLES = re.compile(r"\b(orders|order_items|order_payments|order_reviews)\b")
-PUBLIC_VIEWS = re.compile(r"\b(category_stats|product_stats|state_delivery_stats)\b")
+PUBLIC_VIEWS = re.compile(r"\b(category_stats|product_stats|seller_stats|state_delivery_stats)\b")
 
 
 def missing_period(sql):
@@ -283,7 +288,7 @@ def build_sql_agent(llm, scope, language, state, verbose=False):
     """Satukan LLM, tool run_sql dan instruksi menjadi agent LangChain (dibuat ulang per pertanyaan,
     karena scope dan bahasa jawaban berbeda per login / pertanyaan)."""
     system_prompt = "\n\n".join([
-        RULES.format(schema=get_schema(public_only=scope.role == "customer")),
+        RULES.format(schema=get_schema(scope.role)),
         ANSWER_RULES.format(language=language) + ("\n" + INDONESIAN_TERMS if "indones" in language.lower() else ""),
     ])
     return create_agent(llm, [make_sql_tool(scope, state, verbose)], system_prompt=system_prompt, name="sql_agent")

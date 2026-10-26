@@ -119,7 +119,7 @@ RULES WHEN COMMUNICATING WITH SQL AGENT
 - Send a complete, self-contained question with all relevant filters, dates, categories, and entity IDs from the conversation or previous specialist results. Preserve IDs exactly; never shorten or invent them.
 - Copy the exact `ANSWER LANGUAGE: <language>` instruction from the current user request into every SQL-specialist request. Do not infer language from a rewritten question or tool result.
 - The SQL tools are already bound to the logged-in role and data scope. Never ask the SQL specialist to switch roles or access another user's data, and do not claim data is available beyond the scope enforced by its tools.
-- For a customer user, the SQL specialist only has platform-wide aggregates (per category, per product, delivery time per state). Do not ask it about specific orders, sellers, customers or company revenue.
+- For a customer user, the SQL specialist only has platform-wide aggregates (per category, per product, per seller and category, delivery time per state). Use them for product and seller recommendations (e.g. the best-rated sellers for make up). Do not ask it about specific orders, customers, sellers' revenue or company revenue.
 - Let the SQL specialist write and execute its own read-only queries, handle query correction, and explain database limitations. Do not request raw SQL or expose SQL/tool output to the user. If it reports an error or cannot answer, relay that limitation accurately; ask the user only for missing information that would make the query answerable.
 - If the SQL result provides order IDs needed to answer a review question, preserve the full IDs when sending them to the review specialist. Follow that specialist's limit of at most 50 order IDs per search; otherwise ask the user to narrow the request.
 
@@ -168,7 +168,8 @@ def id_facts(role, scope_id, text):
 	if own:
 		facts.append(f"The seller ID {own[0]} in the request IS the authenticated seller's own ID (allowed).")
 	if other:
-		facts.append(f"The seller ID(s) {', '.join(other)} in the request belong to ANOTHER seller (S1).")
+		facts.append(f"The seller ID(s) {', '.join(other)} in the request belong to ANOTHER seller: only their "
+		             "public rating, review volume and sales rank are allowed, anything else is S1.")
 	return "\nChecked in code: " + " ".join(facts) + "\n"
 
 
@@ -209,11 +210,15 @@ How to decide:
 	authenticated seller ID and denied (S1) when it differs.{id_facts(role, scope_id, question)}
 	Statistics aggregated across the seller's customers (repeat-purchase rate, customer counts, payment
 	mix, state summaries) are not individual customer data; allow them. Themes or quotes from reviews of
-	the seller's own orders are allowed, including category and price filters.
+	the seller's own orders are allowed, including category and price filters. The public aggregates a
+	shopper sees (other sellers' rating, review volume and sales rank, best-rated sellers per category) are
+	allowed too; only other sellers' review comments, revenue, exact sales or orders are S1/S2.
 - customer: the user is anonymous, so "my order" or "my purchases" cannot be looked up; deny those with
 	C2 or C3 and explain that order lookups are not available in this chat. Questions about a product
 	category, product type, brand or price range, and what reviewers say about it, are allowed even when
-	they mention bad sellers in general ("are sellers of shoes slow?"); only a SPECIFIC seller is C1.
+	they mention bad sellers in general ("are sellers of shoes slow?"). Recommending or ranking sellers by
+	rating or sales rank ("5 sellers with the best reviews for make up") is allowed, and so is a seller's
+	public rating; only the review comments or revenue/sales figures of a SPECIFIC seller are C1.
 - Do not deny simply because the request contains an ID, needs SQL, or concerns reviews.
 Use the conversation context only to resolve follow-up references, never to choose the language. If the target is truly
 ambiguous, ask one brief clarifying question. Never reveal protected data. Any denial must be brief,

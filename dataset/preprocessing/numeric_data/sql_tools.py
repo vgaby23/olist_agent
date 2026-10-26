@@ -9,7 +9,8 @@ Lapisan keamanan saat menjalankan SQL dari LLM:
                        seller itu. SQLite mencari di schema temp lebih dulu, jadi SQL biasa (FROM order_items ...)
                        hanya melihat baris milik seller itu. Customer = pembeli ANONIM (tanpa id): tidak ada view
                        transaksi sama sekali, hanya view agregat umum (category_stats, product_stats,
-                       state_delivery_stats) + tabel umum.
+                       seller_stats, state_delivery_stats) + tabel umum. Seller mendapat product_stats &
+                       seller_stats versi customer (tanpa omzet seller lain) + category_stats persis.
   4. authorizer      : untuk seller/customer, membaca tabel main secara langsung (di luar view) ditolak,
                        kecuali tabel umum (products, br_states). Ini menutup celah seperti "main"."order_items".
                        Untuk customer berarti: orders, order_items, customers, sellers, dst. tidak bisa dibaca.
@@ -159,8 +160,40 @@ STATE_DELIVERY_NOTE = (
     "state_code TEXT, state_name TEXT, delivered_orders INTEGER, avg_delivery_days REAL, late_pct REAL"
 )
 
-PUBLIC_VIEWS = [CATEGORY_STATS_VIEW, PRODUCT_STATS_VIEW, STATE_DELIVERY_VIEW]
-PUBLIC_VIEW_NOTES = [CATEGORY_STATS_NOTE, PRODUCT_STATS_NOTE, STATE_DELIVERY_NOTE]
+# Statistik per seller per kategori se-platform (untuk rekomendasi seller, mis. "5 seller review terbaik untuk make up").
+SELLER_STATS_SELECT = """
+WITH items AS (
+    SELECT oi.order_id, oi.seller_id, p.product_category_name_english AS category, oi.price
+    FROM main.order_items oi
+    JOIN main.products p ON p.product_id = oi.product_id
+    JOIN main.orders o   ON o.order_id = oi.order_id
+    WHERE o.is_delivered = 1 AND o.in_trend_period = 1
+),
+sales AS (
+    SELECT seller_id, category, COUNT(*) AS items_sold, ROUND(AVG(price), 2) AS avg_price
+    FROM items GROUP BY seller_id, category
+),
+reviews AS (
+    SELECT x.seller_id, x.category, COUNT(*) AS review_count, ROUND(AVG(x.review_score), 3) AS avg_review_score
+    FROM (SELECT DISTINCT i.order_id, i.seller_id, i.category, r.review_score
+          FROM items i JOIN main.order_reviews r ON r.order_id = i.order_id) x
+    GROUP BY x.seller_id, x.category
+)
+SELECT s.seller_id, se.seller_city, se.seller_state, s.category, s.items_sold, s.avg_price,
+       COALESCE(r.review_count, 0) AS review_count, r.avg_review_score
+FROM sales s
+JOIN main.sellers se ON se.seller_id = s.seller_id
+LEFT JOIN reviews r ON r.seller_id = s.seller_id AND r.category = s.category
+"""
+SELLER_STATS_VIEW = "CREATE TEMP VIEW seller_stats AS" + SELLER_STATS_SELECT
+SELLER_STATS_NOTE = (
+    "VIEW seller_stats (platform-wide per seller and category, delivered orders in 2017-01..2018-08, one review per "
+    "order): seller_id TEXT, seller_city TEXT, seller_state TEXT, category TEXT, items_sold INTEGER, avg_price REAL, "
+    "review_count INTEGER, avg_review_score REAL"
+)
+
+PUBLIC_VIEWS = [CATEGORY_STATS_VIEW, PRODUCT_STATS_VIEW, STATE_DELIVERY_VIEW, SELLER_STATS_VIEW]
+PUBLIC_VIEW_NOTES = [CATEGORY_STATS_NOTE, PRODUCT_STATS_NOTE, STATE_DELIVERY_NOTE, SELLER_STATS_NOTE]
 
 # Customer anonim (aturan C5): items_sold x avg_price yang persis = omzet platform (selisih ~R$60 dari aslinya).
 # Rentang kasar saja tidak cukup: dengan titik tengah rentang, jumlah ~70 kategori tetap memberi ~90% omzet asli
@@ -191,8 +224,24 @@ CUSTOMER_PRODUCT_STATS_VIEW = (f"CREATE TEMP VIEW product_stats AS SELECT produc
                                f"FROM ({PRODUCT_STATS_SELECT})")
 CUSTOMER_PRODUCT_STATS_NOTE = ("VIEW product_stats (platform-wide per product, delivered orders in 2017-01..2018-08, "
                                "one review per order): product_id TEXT, category TEXT, " + CUSTOMER_COLUMNS_NOTE)
-CUSTOMER_VIEWS = [CUSTOMER_CATEGORY_STATS_VIEW, CUSTOMER_PRODUCT_STATS_VIEW, STATE_DELIVERY_VIEW]
-CUSTOMER_VIEW_NOTES = [CUSTOMER_CATEGORY_STATS_NOTE, CUSTOMER_PRODUCT_STATS_NOTE, STATE_DELIVERY_NOTE]
+# sales_rank seller dihitung per kategori ("seller nomor 1 di health_beauty"), bukan se-platform.
+SELLER_COLUMNS = CUSTOMER_COLUMNS.replace("OVER (ORDER BY", "OVER (PARTITION BY category ORDER BY")
+CUSTOMER_SELLER_STATS_VIEW = (f"CREATE TEMP VIEW seller_stats AS SELECT seller_id, seller_city, seller_state, category, "
+                              f"{SELLER_COLUMNS} FROM ({SELLER_STATS_SELECT})")
+CUSTOMER_SELLER_STATS_NOTE = ("VIEW seller_stats (platform-wide per seller and category, delivered orders in "
+                              "2017-01..2018-08, one review per order): seller_id TEXT, seller_city TEXT, "
+                              "seller_state TEXT, category TEXT, " + CUSTOMER_COLUMNS_NOTE.replace(
+                                  "(1 = most items sold)", "(1 = most items sold within the category)"))
+CUSTOMER_VIEWS = [CUSTOMER_CATEGORY_STATS_VIEW, CUSTOMER_PRODUCT_STATS_VIEW, STATE_DELIVERY_VIEW,
+                  CUSTOMER_SELLER_STATS_VIEW]
+CUSTOMER_VIEW_NOTES = [CUSTOMER_CATEGORY_STATS_NOTE, CUSTOMER_PRODUCT_STATS_NOTE, STATE_DELIVERY_NOTE,
+                       CUSTOMER_SELLER_STATS_NOTE]
+# Seller (aturan S1/S2): agregat per produk & per seller sama dengan customer (tanpa omzet seller lain), tapi
+# benchmark kategori tetap persis.
+SELLER_VIEWS = [CATEGORY_STATS_VIEW] + CUSTOMER_VIEWS[1:]
+SELLER_VIEW_NOTES = [CATEGORY_STATS_NOTE] + CUSTOMER_VIEW_NOTES[1:]
+VIEWS = {"company": PUBLIC_VIEWS, "seller": SELLER_VIEWS, "customer": CUSTOMER_VIEWS}
+VIEW_NOTES = {"company": PUBLIC_VIEW_NOTES, "seller": SELLER_VIEW_NOTES, "customer": CUSTOMER_VIEW_NOTES}
 
 # Kunci acak per proses untuk pseudonim pembeli (seller). Sama selama aplikasi berjalan, jadi COUNT DISTINCT dan
 # JOIN tetap benar; tidak bisa dibalik ke id asli.
@@ -226,10 +275,11 @@ def get_connection():
     return sqlite3.connect(f"file:{DB_PATH.as_posix()}?mode=ro", uri=True)
 
 
-@lru_cache(maxsize=2)
-def get_schema(public_only=False):
+@lru_cache(maxsize=3)
+def get_schema(role="company"):
     """Teks skema (tabel, kolom, tipe, catatan) untuk prompt LLM. Dibaca sekali lalu di-cache.
-    public_only=True (customer anonim): hanya tabel umum + view agregat, tabel transaksi tidak disebut."""
+    role "customer" (anonim): hanya tabel umum + view agregat, tabel transaksi tidak disebut."""
+    public_only = role == "customer"
     conn = get_connection()
     try:
         tables = [r[0] for r in conn.execute(
@@ -243,7 +293,7 @@ def get_schema(public_only=False):
                 note = COLUMN_NOTES.get(f"{table}.{name}")
                 cols.append(f"  {name} {ctype}" + (f"  -- {note}" if note else ""))
             lines.append(f"TABLE {table}:\n" + "\n".join(cols))
-        lines += CUSTOMER_VIEW_NOTES if public_only else PUBLIC_VIEW_NOTES
+        lines += VIEW_NOTES[role]
         return "\n\n".join(lines)
     finally:
         conn.close()
@@ -376,7 +426,7 @@ def run_query(sql, scope=None, max_rows=MAX_ROWS, timeout=QUERY_TIMEOUT_S):
     try:
         conn.setlimit(sqlite3.SQLITE_LIMIT_LENGTH, MAX_VALUE_BYTES)   # cegah zeroblob/teks raksasa di memori
         conn.create_function("pseudonym", 1, _pseudonym, deterministic=True)
-        view_sqls = _scope_views(scope) + (CUSTOMER_VIEWS if scope.role == "customer" else PUBLIC_VIEWS)
+        view_sqls = _scope_views(scope) + VIEWS[scope.role]
         for view_sql in view_sqls:
             conn.execute(view_sql)
         temp_names = frozenset(re.search(r"CREATE TEMP VIEW (\w+)", v).group(1) for v in view_sqls)
