@@ -15,6 +15,7 @@ Catatan:
   - periode default 2017-01..2018-08; data di luar periode itu parsial; 2018 hanya Januari-Agustus
   - label kategori kosong = 'uncategorized'; view category_stats untuk pembanding se-platform
 """
+import contextvars
 import os
 import re
 import threading
@@ -371,6 +372,12 @@ def demo_user_id(role):
     return DEMO_USER_IDS.get((role or "").strip().lower())
 
 
+# The UI sets a fresh list here before each request; ask_data_agent appends its query results ({"sql", "data"})
+# so the page can show them as tables/charts. A ContextVar (not a global list) because the supervisor is cached
+# and shared between sessions; LangGraph copies the context into its worker threads.
+collected_results = contextvars.ContextVar("collected_results", default=None)
+
+
 def make_data_tools(role, user_id=None):
     """Buat tool data untuk SATU sesi login. role (dan user_id) diambil dari halaman login, bukan dari LLM.
     Tanpa user_id, seller memakai akun demo (demo_user_id); customer selalu anonim.
@@ -396,6 +403,9 @@ def make_data_tools(role, user_id=None):
             result = ask_sql_agent(question, role=scope.role, user_id=scope.user_id, verbose=False)
         except Exception as error:          # never crash the supervisor
             return f"The data agent failed: {type(error).__name__}: {str(error)[:200]}"
+        sink = collected_results.get()
+        if sink is not None:
+            sink.extend(result["results"])
         return result["answer"]
 
     return [ask_data_agent]

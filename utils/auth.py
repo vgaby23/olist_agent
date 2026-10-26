@@ -51,17 +51,36 @@ def logout():
     st.session_state['messages'] = []
     st.session_state['pending_prompt'] = None
 
+ACCOUNT_LABELS = {"customer": "🛒 Shopper", "seller": "🏪 Seller", "admin": "🏢 Olist staff"}
+ACCOUNT_HELP = {
+    "customer": "Find products and sellers and read what other shoppers say. No account ID needed.",
+    "seller": "Your own shop's sales, deliveries and reviews, plus category benchmarks.",
+    "admin": "Platform-wide data on orders, revenue, sellers, customers and reviews.",
+}
+
+# Test seller for the demo: the seller with the most orders (1,854) and reviews (1,835) in the anonymised dataset
+SAMPLE_SELLER_ID = "6560211a19b47992c3666cc44a7e94c0"
+
+def use_sample_seller():
+    st.session_state["login_user_id"] = SAMPLE_SELLER_ID
+
 def login_page():
     if not st.session_state.get("logged_in"):
-        st.title("Platform Login")
+        st.caption("Your assistant for shopping on Olist and for running your shop.")
 
-        users = list(DB.keys())
-        account = st.selectbox("Role", options=users, index=0, key="login_account")
-        role = DB[account]["role"]
-        if role == "seller":
-            st.text_input("Seller ID", key="login_user_id")
-        st.text_input("Password", type="password", key="password")
-        st.button("Login", on_click=verify_login)
+        with st.container(border=True):
+            st.subheader("Log in")
+            users = list(DB.keys())
+            account = st.selectbox("I am a", options=users, index=0, key="login_account",
+                                   format_func=lambda name: ACCOUNT_LABELS.get(name, name))
+            st.caption(ACCOUNT_HELP.get(account, ""))
+            role = DB[account]["role"]
+            if role == "seller":
+                st.text_input("Seller ID", key="login_user_id", placeholder="32-character seller ID")
+                st.caption(f"For testing: `{SAMPLE_SELLER_ID}`, the seller with the most orders and reviews.")
+                st.button("Use sample seller ID", icon="🧪", on_click=use_sample_seller)
+            st.text_input("Password", type="password", key="password")
+            st.button("Log in", on_click=verify_login, type="primary", width="stretch")
     else:
         with st.sidebar:
             st.write(f"Logged in as: **{st.session_state['username']}**")
