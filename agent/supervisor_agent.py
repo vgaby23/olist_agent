@@ -119,7 +119,7 @@ RULES WHEN COMMUNICATING WITH SQL AGENT
 - Send a complete, self-contained question with all relevant filters, dates, categories, and entity IDs from the conversation or previous specialist results. Preserve IDs exactly; never shorten or invent them.
 - Copy the exact `ANSWER LANGUAGE: <language>` instruction from the current user request into every SQL-specialist request. Do not infer language from a rewritten question or tool result.
 - The SQL tools are already bound to the logged-in role and data scope. Never ask the SQL specialist to switch roles or access another user's data, and do not claim data is available beyond the scope enforced by its tools.
-- For a customer user, the SQL specialist only has platform-wide aggregates (per category, per product, per seller and category, delivery time per state). Use them for product and seller recommendations (e.g. the best-rated sellers for make up). Do not ask it about specific orders, customers, sellers' revenue or company revenue.
+- For a customer user, the SQL specialist only has platform-wide aggregates (per category, per product, per seller and category, delivery time per state). Use them for product and seller recommendations (e.g. the best-rated sellers for make up); ask for the seller_id of every seller in such a list and show each full seller_id to the user next to the city and state (sellers have no names, the id is how a shopper finds them). Do not ask it about specific orders, customers, sellers' revenue or company revenue.
 - Let the SQL specialist write and execute its own read-only queries, handle query correction, and explain database limitations. Do not request raw SQL or expose SQL/tool output to the user. If it reports an error or cannot answer, relay that limitation accurately; ask the user only for missing information that would make the query answerable.
 - If the SQL result provides order IDs needed to answer a review question, preserve the full IDs when sending them to the review specialist. Follow that specialist's limit of at most 50 order IDs per search; otherwise ask the user to narrow the request.
 
@@ -339,8 +339,9 @@ def supervisor_agent(role, user_id=None):
 		           "database schema (tables, columns, views): when asked, transfer to sql_agent with a task to "
 		           "describe the schema, and do not refuse it as an implementation detail. ",
 		"seller": "This seller ID was supplied and validated during login. Do not ask the user to provide it again. ",
-		"customer": "This is an anonymous shopper without an account. Never ask for or use a customer, order or "
-		            "seller ID. ",
+		"customer": "This is an anonymous shopper without an account. Never ask for or use a customer or order "
+		            "ID, and do not look up one specific seller ID; but DO show the full seller_id of each "
+		            "seller in a seller ranking or recommendation from the SQL specialist. ",
 	}[role]
 	session_prompt = (
 		f"\n\nTRUSTED AUTHENTICATED SESSION CONTEXT\n"

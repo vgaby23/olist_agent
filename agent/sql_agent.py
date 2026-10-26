@@ -186,7 +186,8 @@ def make_role_note(scope):
                 "read; every other table is blocked. Answer with these aggregates only. For shoppers, items sold "
                 "and average price are not available: use sales_rank and price_level for ordering, report "
                 "price_band and review_volume, and never estimate sales volume or revenue. Recommending or ranking "
-                "sellers by rating or sales_rank with seller_stats is allowed. Questions about one specific order "
+                "sellers by rating or sales_rank with seller_stats is allowed: always select and show the full "
+                "seller_id with seller_city and seller_state for each seller. Questions about one specific order "
                 "or customer, a seller's revenue or company revenue cannot be answered: say so politely without "
                 "calling run_sql.")
     return "The user is a company (platform) employee and can see all data."
