@@ -64,6 +64,7 @@ STARTER_QUESTIONS = {
 # Columns that identify a customer (policy S3/C3): never shown to a seller or shopper, even in a data table
 HIDDEN_COLUMNS = re.compile(r"customer_(unique_)?id|zip", re.IGNORECASE)
 TIME_COLUMN = re.compile(r"month|year|date|week|day", re.IGNORECASE)
+MARKDOWN_TABLE = re.compile(r"^\s*\|?\s*:?-{3,}:?\s*(\|\s*:?-{3,}:?\s*)+\|?\s*$", re.MULTILINE)  # header separator row
 MAX_TABLES = 3
 
 @st.cache_resource
@@ -186,9 +187,15 @@ def make_chart(data):
         x=alt.X(f"{y}:Q", title=y), y=alt.Y(f"{x}:N", sort="-x", title=x), tooltip=list(data.columns))
 
 
-def show_tables(tables, key):
-    """Each SQL result under the answer: chart and table tabs when a chart fits, plus a CSV download."""
-    for number, data in enumerate(latest_versions(tables)):    # also answers saved before de-duplication
+def show_tables(tables, key, collapsed=False):
+    """Each SQL result under the answer: chart and table tabs when a chart fits, plus a CSV download.
+    Collapsed into an expander when the answer already shows the data as a markdown table."""
+    tables = latest_versions(tables)    # also answers saved before de-duplication
+    if collapsed and tables:
+        with st.expander("📋 Data & CSV", expanded=False):
+            show_tables(tables, key)
+        return
+    for number, data in enumerate(tables):
         chart = make_chart(data)
         if chart is not None:
             chart_tab, table_tab = st.tabs(["📈 Chart", "📋 Table"])
@@ -264,8 +271,10 @@ for number, (user_message, assistant_message) in enumerate(turns):
             if assistant_message.additional_kwargs.get("violated_rule"):
                 show_refusal(assistant_message, role, number, latest=number == len(turns) - 1 and not busy)
             else:
-                st.markdown(supervisor_agent.clean_answer(assistant_message.text))
-                show_tables(assistant_message.additional_kwargs.get("tables", []), number)
+                answer = supervisor_agent.clean_answer(assistant_message.text)
+                st.markdown(answer)
+                show_tables(assistant_message.additional_kwargs.get("tables", []), number,
+                            collapsed=bool(MARKDOWN_TABLE.search(answer)))
             show_answer_details(assistant_message)
 
 if st.session_state.get("last_error") and not busy:
