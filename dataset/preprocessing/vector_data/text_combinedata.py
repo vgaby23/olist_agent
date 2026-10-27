@@ -47,7 +47,7 @@ def group_items_by_order(items, product_names):
                 "product_id": [],
                 "product_name": [],
                 "price": [],
-                # An order can have several sellers; the API has ONE seller_id,
+                # An order can have several sellers, but each document stores ONE seller_id,
                 # so we use the seller of the first item.
                 "seller_id": item["seller_id"],
             }

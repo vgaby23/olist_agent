@@ -2,13 +2,13 @@
 rag_core.py - the SEARCH side: ask a question, get the matching reviews back
 ============================================================================
 
-ingest.py WRITES reviews into Qdrant (done once).
+text_ingest.py WRITES reviews into Qdrant (done once).
 rag_core.py READS them (done every time someone asks a question). This is the "R" in RAG:
 Retrieval.
 
 Who uses this file:
-    app.py            the API calls search() for every request
-    check_upload.py   your own test after an upload (no API needed)
+    agent/rag_agent.py   the review agent calls search() for every search it runs
+    check_upload.py      a quick manual check after an upload
 
 WHAT search() DOES, STEP BY STEP
     1. Take the question, e.g. "late delivery", and the filters, e.g. rating 1 or 2 only.
@@ -18,9 +18,9 @@ WHAT search() DOES, STEP BY STEP
        looking only at reviews that pass the filter
     5. Return them as a simple list: text + score + metadata
 
-TRY IT WITHOUT THE API (the .env file must contain your Qdrant and OpenAI keys)
+TRY IT (from the project root; the .env file must contain the Qdrant and OpenAI keys)
     from dotenv import load_dotenv; load_dotenv()
-    import rag_core
+    from dataset.preprocessing.vector_data import rag_core
     results = rag_core.search("entrega atrasada", top_k=3, filters={"review_score": {"lte": 2}})
     print(results[0]["content"])
 
@@ -35,7 +35,8 @@ from qdrant_client import models
 
 from dataset.preprocessing.vector_data import text_vectordb as vectordb
 
-# The most reviews one request may ask for. app.py uses it to reject something like top_k=100000.
+# Upper limit for top_k, meant for callers to reject very large requests (e.g. top_k=100000).
+# search() itself does not check it; the review agent caps its own searches (how_many <= 10, SEARCH_POOL).
 MAX_TOP_K = int(os.environ.get("MAX_TOP_K", "50"))
 
 
@@ -69,7 +70,7 @@ RANGE_WORDS = {"gt", "gte", "lt", "lte"}
 
 class FilterError(ValueError):
     """The caller sent a filter we cannot use (unknown field, wrong kind of value ...).
-    app.py catches this and answers with HTTP 400 and a clear message."""
+    agent/rag_agent.py catches this and passes the message back to the LLM, so it can fix its filters."""
 
 
 def is_number(value):
@@ -167,11 +168,14 @@ def build_filter(filters):
 # Part 2: SEARCH
 # =============================================================================
 def search(query, top_k=5, filters=None):
-    """Find the reviews that match the meaning of `query`.
+    """Find the reviews whose meaning is closest to `query`.
 
     query    the question, e.g. "late delivery complaints"
     top_k    how many reviews to return
     filters  optional dictionary, see Part 1
+
+    Returns a list of {"content", "relevance_score", "metadata"}, best match first.
+    Raises FilterError when the filters are not valid.
     """
     qdrant_filter = build_filter(filters)      # raises FilterError if the filters are wrong
 
@@ -184,7 +188,7 @@ def search(query, top_k=5, filters=None):
     results = []
     for document, score in hits:
         # LangChain adds internal keys that start with "_" (like "_id"). Remove them, so that
-        # "metadata" contains only the fields we agreed on.
+        # "metadata" contains only the review fields saved at ingest time (see text_combinedata.py).
         metadata = {}
         for key, value in document.metadata.items():
             if not key.startswith("_"):

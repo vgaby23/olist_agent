@@ -84,8 +84,9 @@ def load_product_names(data_dir):
     """Return a dictionary: {"p1": "health_beauty", "p2": "computers_accessories", ...}
     (product_id -> English category name).
 
-    Olist has no product names, only categories. We call the field "product_name"
-    because that is the name in the agreed API."""
+    Olist has no product names, only categories. The field is still called "product_name"
+    because that name is used everywhere downstream: the Qdrant metadata, the search filters
+    and the review agent."""
     products = pd.read_csv(os.path.join(data_dir, "olist_products_dataset.csv"))
     translation = pd.read_csv(os.path.join(data_dir, "product_category_name_translation.csv"))
 

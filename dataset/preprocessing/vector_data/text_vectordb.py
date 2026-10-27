@@ -3,10 +3,10 @@ text_vectordb.py - STEP 4: Qdrant (the vector database)
 =======================================================
 
 What is here:
-    get_client()          connect to Qdrant                          (used by ingest AND the API)
-    get_store()           LangChain's wrapper to SEARCH the collection   (used by the API)
-    ensure_collection()   create the collection + indexes            (used by ingest)
-    upload_documents()    embed the documents and upload them        (used by ingest)
+    get_client()          connect to Qdrant                              (used by text_ingest.py AND rag_core.py)
+    get_store()           LangChain's wrapper to SEARCH the collection   (used by rag_core.py)
+    ensure_collection()   create the collection + indexes                (used by text_ingest.py)
+    upload_documents()    embed the documents and upload them            (used by text_ingest.py)
 
 Where Qdrant lives is set with environment variables:
     QDRANT_URL       e.g. https://xxxx.cloud.qdrant.io:6333   (default http://localhost:6333)
@@ -34,6 +34,7 @@ META = "metadata."
 
 @lru_cache(maxsize=1)      # connect once, then reuse the same connection
 def get_client():
+    """Connect to Qdrant: a local folder (QDRANT_PATH), in-memory (QDRANT_URL=":memory:") or a server."""
     if QDRANT_PATH:                      # a local folder: only one program can use it at a time
         return QdrantClient(path=QDRANT_PATH)
     if QDRANT_URL == ":memory:":         # lives in RAM, gone when the program stops (used by the tests)
@@ -43,7 +44,7 @@ def get_client():
 
 @lru_cache(maxsize=1)
 def get_store():
-    """Connect to the EXISTING collection (ingest.py creates it). Used for searching."""
+    """Connect to the EXISTING collection (text_ingest.py creates it). Used for searching."""
     return QdrantVectorStore(
         client=get_client(),
         collection_name=COLLECTION_NAME,
@@ -75,7 +76,7 @@ def ensure_collection(recreate=True):
     # A "payload index" makes filtering on a field fast (like an index in SQL).
     fields_to_index = [
         ("review_score", models.PayloadSchemaType.INTEGER),
-        ("price", models.PayloadSchemaType.INTEGER),
+        ("price", models.PayloadSchemaType.INTEGER),        # prices are stored as whole reais (see text_cleaning.load_items)
         ("seller_city", models.PayloadSchemaType.KEYWORD),
         ("seller_id", models.PayloadSchemaType.KEYWORD),
         ("product_name", models.PayloadSchemaType.KEYWORD),

@@ -8,18 +8,17 @@ WHAT IT DOES
     answer with example quotes. It does NOT do numbers (counts, averages): that is the SQL agent's job.
 
 HOW THE SUPERVISOR USES IT
-    The supervisor passes a role-scoped review agent to LangGraph's create_supervisor:
+    agent/supervisor_agent.py builds one review agent per login and registers it, next to the SQL
+    specialist, with LangGraph's create_supervisor:
 
-        from agent import rag_agent, sql_agent
         review_agent = rag_agent.build_rag_agent(llm, role=role, user_id=user_id)
-        data_agent = sql_agent.make_data_tools(role, user_id)
-        supervisor = create_supervisor(
-            agents=[review_agent, data_agent], model=llm, prompt=SUPERVISOR_PROMPT
-        ).compile()
 
-    build_rag_agent() returns a specialist agent. Company sessions can search platform-wide reviews;
-    seller sessions are forced to their own seller ID, and anonymous customer sessions cannot search by
-    order. Those constraints are enforced in code (apply_scope).
+    The agent is "role-scoped": what it may search depends on who is logged in.
+      * company sessions can search all reviews,
+      * seller sessions are always limited to their own seller_id,
+      * anonymous customer sessions cannot search by order.
+    These limits are enforced in code (apply_scope, Part 2), not only in the prompt.
+
     To call the review agent directly (question in, text out, no memory between calls):
 
         from agent.rag_agent import ask_rag_agent
@@ -41,9 +40,9 @@ HOW THE SUPERVISOR USES IT
         question: "What did order <order_id> say?". Price limits ("above 150 BRL") also work as filters.
       * A SELLER user's reviews are already limited to their shop, so "Why do my customers give low ratings?"
         is enough. For one product: "What do reviews of product <product_id> say?".
-      * The answer is plain text: a summary plus example quotes, each with its rating, product category, seller city
-        and order_id.
-        order_id links to the SQL tables, so the SQL agent can look up more about that order.
+      * The answer is plain text: a summary plus example quotes, each with its rating, product category,
+        seller city and order_id. The order_id is the same key as in the SQL tables, so the SQL agent can
+        look up more about that order.
       * If something goes wrong the answer is a sentence starting with "The review search failed" or
         similar, never an exception.
 
@@ -53,11 +52,11 @@ WHAT IT NEEDS (in the .env file)
     LLM_MODEL                 optional, default gpt-4o-mini
     CATEGORIES_FILE           optional, path to categories.json (written by the ingest step)
 
-TRY IT
-    python rag_agent.py                                  chat in the terminal, "exit" to stop
-    python rag_agent.py "why do people give 1 star?"     one question
-    python rag_agent.py --show-steps                     also print every search the agent runs
-    python rag_agent.py --role seller                    as the demo seller (or --user-id <id>)
+TRY IT (run from the project root folder)
+    python -m agent.rag_agent                                  chat in the terminal, "exit" to stop
+    python -m agent.rag_agent "why do people give 1 star?"     one question
+    python -m agent.rag_agent --show-steps                     also print every search the agent runs
+    python -m agent.rag_agent --role seller                    as the demo seller (or --user-id <id>)
 
 THE FILE HAS 5 PARTS
     1. Settings and finding your files
@@ -76,7 +75,8 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
-# MUST run before "import rag_core": the files it imports read the .env values when they are imported.
+# Load the .env file FIRST. Some project files imported below (rag_core -> text_vectordb, text_embedding)
+# read settings such as QDRANT_URL the moment they are imported, so .env must already be loaded by then.
 load_dotenv()
 
 from langchain.agents import create_agent
@@ -89,12 +89,15 @@ from agent.llm import chat_model
 # =============================================================================
 LLM_MODEL = os.environ.get("LLM_MODEL", "gpt-4o-mini")      # the OpenAI chat model used as the "brain"
 
-# The "match" score of a review is a cosine similarity: higher = closer to the question.
-# Tuned on the full index (34,732 reviews) with test_folder/tune_thresholds.py:
+# The "match" score of a review is a cosine similarity between the question and the review:
+# 1.0 = same meaning, lower = less related.
+# Measured on the full index (34,732 reviews) with test_folder/tune_thresholds.py:
 #   real topics, Portuguese query      0.63 to 0.92      real topics, English query     0.46 to 0.68
 #   nonsense / near-miss, Portuguese   up to 0.56        nonsense, English              up to 0.41
-# No single number separates them, so: below MIN_MATCH a review is dropped, below WEAK_MATCH it is
-# marked "(weak)" and the LLM must read it carefully. The agent is told to search in Portuguese.
+# No single number separates real topics from nonsense, so we use two thresholds (MIN_MATCH and
+# WEAK_MATCH, a few lines below): under MIN_MATCH a review is dropped, under WEAK_MATCH it is kept but
+# marked "(weak)" so the LLM reads it carefully. Portuguese queries score higher, which is why the
+# agent is told to search in Portuguese.
 MAX_ORDER_IDS = 50                                          # most order_ids accepted in one search
 SEARCH_POOL = 50                                            # how many reviews are checked when must_contain is used
 MIN_MATCH = float(os.environ.get("MIN_MATCH", "0.45"))      # below this a review is dropped (0 = keep everything)
@@ -122,6 +125,7 @@ def is_general_query(query):
 
 THIS_FOLDER = Path(__file__).resolve().parent
 
+# These imports come after load_dotenv() on purpose: they read .env settings when imported.
 from agent.language import guess_language
 from agent.sql_agent import demo_user_id
 from dataset.preprocessing.numeric_data.sql_tools import Scope, make_scope
@@ -180,7 +184,11 @@ def retrieve(query, top_k, filters):
 
 
 def find_categories():
-    """Load the category names saved by the ingest step (categories.json). Empty list if not found."""
+    """Load the product category names saved by the ingest step (categories.json).
+
+    Looks at CATEGORIES_FILE first, then for a categories.json in the current folder, agent/, the
+    project root and its parent. Returns an empty list if none is found (the prompt then has no
+    category list)."""
     path = os.environ.get("CATEGORIES_FILE")
     if not path:
         for folder in (Path.cwd(), THIS_FOLDER, THIS_FOLDER.parent, THIS_FOLDER.parent.parent):
@@ -545,12 +553,14 @@ def make_role_note(scope):
 
 
 def build_rag_agent(llm=None, scope=None, role=None, user_id=None):
-    """Put the LLM, the tool and the instructions together. Returns the agent.
+    """Put the LLM, the search tool and the instructions together. Returns the agent.
 
-    `llm` is optional: normally we create the OpenAI model here. Pass the login either as `scope`
-    (sql_tools.make_scope) or as `role` + `user_id` (validated here, raises ValueError when invalid).
-    Without either the agent sees everything (company). Seller/customer tools are scoped to their
-    authenticated records; company review search remains platform-wide.
+    llm      optional. If not given, the chat model from LLM_MODEL is created here.
+    scope    the login, as made by sql_tools.make_scope(...), OR
+    role, user_id
+             the login as plain values; they are validated here (ValueError when invalid).
+    With no login at all the agent runs as "company" and can search all reviews.
+    A seller or customer agent only sees what their role allows (see apply_scope).
     """
     if llm is None:
         llm = chat_model(LLM_MODEL, temperature=0)            # temperature 0 = least random (if the model allows it)
@@ -571,6 +581,7 @@ _agents = {}           # one agent per login, built on first use and then reused
 
 
 def get_agent(scope):
+    """Return the cached agent for this login, building it the first time."""
     if scope not in _agents:
         _agents[scope] = build_rag_agent(scope=scope)
     return _agents[scope]
@@ -601,7 +612,7 @@ def ask_rag_agent(question, show_steps=False, role="company", user_id=None):
                 shown = str(message.content)
                 print("   [tool result]\n" + "\n".join("      " + line for line in shown[:3000].splitlines()))
 
-    return result["messages"][-1].text     # .text: newer models return a list of content blocks
+    return result["messages"][-1].text     # last message = final answer; .text works whether the model returns a string or a list of content blocks
 
 
 # The same function, packaged as a TOOL, so a supervisor agent can use it directly.
@@ -649,6 +660,7 @@ def chat(show_steps=False, role="company", user_id=None):
 
 
 def main(argv=None):
+    """Command-line entry point. Reads --show-steps, --role and --user-id; any remaining words are the question."""
     args = list(sys.argv[1:] if argv is None else argv)
 
     show_steps = "--show-steps" in args

@@ -1,3 +1,12 @@
+"""
+check_upload.py - quick manual check after running text_ingest.py
+
+Prints how many reviews are in the Qdrant collection, the vector size, three stored reviews,
+and the result of one test search (rating 1-2 only), so you can see the upload worked.
+
+Run from the project root (the .env file must contain the Qdrant and OpenAI keys):
+    python -m dataset.preprocessing.vector_data.check_upload
+"""
 from dotenv import load_dotenv
 load_dotenv()
 
@@ -10,6 +19,7 @@ name = text_vectordb.COLLECTION_NAME
 print("points in collection :", client.count(name).count)
 print("vector size          :", client.get_collection(name).config.params.vectors.size)
 
+# client.scroll reads stored points without searching; with_vectors=False skips the long number lists
 points, _ = client.scroll(name, limit=3, with_payload=True, with_vectors=False)
 for p in points:
     print("-" * 60)

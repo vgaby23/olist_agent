@@ -1,6 +1,6 @@
 """
-ingest.py - put the Olist review comments into Qdrant (the vector database)
-==========================================================================
+text_ingest.py - put the Olist review comments into Qdrant (the vector database)
+===============================================================================
 
 This file only RUNS the steps in order. The work happens in four files:
 
@@ -9,18 +9,18 @@ This file only RUNS the steps in order. The work happens in four files:
     text_embedding.py     3. the embedding model (text -> vector)
     text_vectordb.py      4. Qdrant: create the collection, embed and upload
 
-Run it once, and again only when the data changes. The API (app.py) later searches
-what this script uploaded.
+Run it once, and again only when the data changes. The review agent (agent/rag_agent.py,
+through rag_core.py) later searches what this script uploaded.
 
-HOW TO RUN
+HOW TO RUN (from the project root)
   # 1) Try it WITHOUT Qdrant first: builds the documents and prints 3 examples
-  python ingest.py --data-dir ./data --dry-run
+  python -m dataset.preprocessing.vector_data.text_ingest --data-dir ./data --dry-run
 
   # 2) The real thing (needs Qdrant details and the embedding model)
   export QDRANT_URL=https://xxxx.cloud.qdrant.io:6333
   export QDRANT_API_KEY=your-key
-  python ingest.py --data-dir ./data --limit 500     # small test: only 500 reviews
-  python ingest.py --data-dir ./data                 # everything
+  python -m dataset.preprocessing.vector_data.text_ingest --data-dir ./data --limit 500   # small test: only 500 reviews
+  python -m dataset.preprocessing.vector_data.text_ingest --data-dir ./data               # everything
 """
 import argparse
 import json
@@ -35,11 +35,13 @@ load_dotenv()
 from dataset.preprocessing.vector_data import text_combinedata
 from dataset.preprocessing.vector_data import text_vectordb
 
-# The agent's image step needs the list of valid category names. We save it here.
+# Save the list of valid category names. The review agent puts it in its prompt, and the image step
+# (utils/input_preprocessing.py) uses it to check that a guessed category really exists.
 CATEGORIES_FILE = os.environ.get("CATEGORIES_FILE", "categories.json")
 
 
 def save_categories(categories):
+    """Write the category names to CATEGORIES_FILE as a JSON list."""
     with open(CATEGORIES_FILE, "w", encoding="utf-8") as file:
         json.dump(categories, file, ensure_ascii=False, indent=2)
 
@@ -58,7 +60,7 @@ def ingest(data_dir=".", recreate=True, batch_size=64, limit=None):
     print(f"Embedding and uploading {len(documents):,} documents (this can take a while) ...")
     text_vectordb.upload_documents(documents, ids, batch_size)
 
-    # Save the category names for the agent (it uses them to check the image category).
+    # Save the category names for the review agent and the image step (see CATEGORIES_FILE above).
     save_categories(categories)
 
     print(f"Done: {len(documents):,} documents in collection '{text_vectordb.COLLECTION_NAME}'.")
