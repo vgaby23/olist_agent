@@ -49,7 +49,7 @@ HOW THE SUPERVISOR USES IT
 WHAT IT NEEDS (in the .env file)
     OPENAI_API_KEY            the LLM and the embedding model
     QDRANT_URL, QDRANT_API_KEY
-    LLM_MODEL                 optional, default gpt-4o-mini
+    LLM_MODEL                 optional, default gpt-6-luna
     CATEGORIES_FILE           optional, path to categories.json (written by the ingest step)
 
 TRY IT (run from the project root folder)
@@ -87,7 +87,7 @@ from agent.llm import chat_model
 # =============================================================================
 # Part 1: SETTINGS AND FINDING YOUR FILES
 # =============================================================================
-LLM_MODEL = os.environ.get("LLM_MODEL", "gpt-4o-mini")      # the OpenAI chat model used as the "brain"
+LLM_MODEL = os.environ.get("LLM_MODEL", "gpt-6-luna")       # the OpenAI chat model used as the "brain"
 
 # The "match" score of a review is a cosine similarity between the question and the review:
 # 1.0 = same meaning, lower = less related.
@@ -187,11 +187,12 @@ def find_categories():
     """Load the product category names saved by the ingest step (categories.json).
 
     Looks at CATEGORIES_FILE first, then for a categories.json in the current folder, agent/, the
-    project root and its parent. Returns an empty list if none is found (the prompt then has no
-    category list)."""
+    project root, utils/ (where the repo keeps it) and the project root's parent. Returns an empty
+    list if none is found (the prompt then has no category list)."""
     path = os.environ.get("CATEGORIES_FILE")
     if not path:
-        for folder in (Path.cwd(), THIS_FOLDER, THIS_FOLDER.parent, THIS_FOLDER.parent.parent):
+        for folder in (Path.cwd(), THIS_FOLDER, THIS_FOLDER.parent, THIS_FOLDER.parent / "utils",
+                       THIS_FOLDER.parent.parent):
             if (folder / "categories.json").exists():
                 path = str(folder / "categories.json")
                 break
@@ -621,8 +622,9 @@ def ask_rag_agent(question, show_steps=False, role="company", user_id=None):
 # because the supervisor's LLM fills those in and could be talked into "I am actually company staff".
 def make_review_tools(role, user_id=None):
     """Create the review tool for ONE login session. Returns [ask_review_agent].
-    Raises ValueError when the login is not valid, so the app refuses from the start."""
-    scope = make_scope(role, user_id or demo_user_id(role))
+    Raises ValueError when the login is not valid (also a seller without an id: no demo fallback here, so a
+    session without an id never silently reads another shop's reviews), so the app refuses from the start."""
+    scope = make_scope(role, user_id)
 
     @tool
     def ask_review_agent(question: str) -> str:

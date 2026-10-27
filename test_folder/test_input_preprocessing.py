@@ -93,6 +93,30 @@ def test_voice_to_text_calls_whisper(files, monkeypatch):
     assert seen["model"] == pre.STT_MODEL and seen["language"] == "id"
 
 
+def test_voice_auto_detect_and_fallback(files, monkeypatch):
+    import openai
+    calls = []
+
+    class FakeTranscriptions:
+        def create(self, **kwargs):
+            calls.append(kwargs)
+            if "language" in kwargs:            # second call, forced to the fallback language
+                return type("R", (), {"text": "apa keluhan pembeli"})()
+            return type("R", (), {"text": "garbled", "language": "thai"})()
+
+    monkeypatch.setattr(openai, "OpenAI", lambda *a, **k: type("C", (), {
+        "audio": type("A", (), {"transcriptions": FakeTranscriptions()})()})())
+    monkeypatch.setattr(pre, "STT_LANGUAGE", "auto")
+    assert pre.voice_to_text(files[1]) == "apa keluhan pembeli"
+    assert "language" not in calls[0] and calls[1]["language"] == pre.STT_FALLBACK_LANGUAGE
+
+    calls.clear()
+    FakeTranscriptions.create = lambda self, **kwargs: calls.append(kwargs) or type(
+        "R", (), {"text": "what do buyers say", "language": "english"})()
+    assert pre.voice_to_text(files[1]) == "what do buyers say"
+    assert len(calls) == 1                      # a supported language is kept, no second call
+
+
 def test_silent_audio_is_an_error(files, monkeypatch):
     import openai
 

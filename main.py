@@ -11,6 +11,7 @@ from utils.chat_config import MARKDOWN_TABLE, STARTER_QUESTIONS
 from utils.chat_display import (
     answer_tables,
     collect_token_usage,
+    markdown_safe,
     show_answer_details,
     show_refusal,
     show_tables,
@@ -35,7 +36,7 @@ logging.basicConfig(format="%(asctime)s %(name)s: %(message)s")
 logging.getLogger("utils").setLevel(logging.INFO)
 
 # Company and seller answers often come with tables, which need the room; the shopper chat stays narrow
-WIDE_ROLES = {"staff", "seller"}
+WIDE_ROLES = {"company", "seller"}
 st.set_page_config(page_title="Olist Virtual Assistant", page_icon="🛍️",
                    layout="wide" if st.session_state.get("role") in WIDE_ROLES else "centered")
 
@@ -107,7 +108,7 @@ if not turns and not busy:
 
 for number, (user_message, assistant_message) in enumerate(turns):
     with st.chat_message("user", avatar=AVATARS["user"]):
-        st.markdown(user_message.additional_kwargs.get("display_content", user_message.content))
+        st.markdown(markdown_safe(user_message.additional_kwargs.get("display_content", user_message.content)))
         if user_message.additional_kwargs.get("image"):
             st.image(user_message.additional_kwargs["image"], width=300)
         if user_message.additional_kwargs.get("audio"):
@@ -120,7 +121,7 @@ for number, (user_message, assistant_message) in enumerate(turns):
                 show_refusal(assistant_message, role, number, latest=number == len(turns) - 1 and not busy)
             else:
                 answer = supervisor_agent.clean_answer(assistant_message.text)
-                st.markdown(answer)
+                st.markdown(markdown_safe(answer))
                 show_tables(assistant_message.additional_kwargs.get("tables", []), number,
                             collapsed=bool(MARKDOWN_TABLE.search(answer)))
             show_answer_details(assistant_message)
@@ -139,6 +140,9 @@ if submitted := st.chat_input("Message the Olist assistant", accept_file = True,
     st.rerun()
 
 if prompt := st.session_state.get("pending_prompt"):
+    # Cleared right away: if anything below crashes, the next rerun must not run the same prompt again
+    # with the input still disabled
+    st.session_state["pending_prompt"] = None
     st.session_state["last_error"] = None
     st.session_state["failed_prompt"] = None
     started = time.monotonic()
@@ -162,7 +166,7 @@ if prompt := st.session_state.get("pending_prompt"):
     # Display the user's message in the chat interface
     with st.chat_message("user", avatar=AVATARS["user"]):
         if prompt_text:
-            st.markdown(prompt_text)
+            st.markdown(markdown_safe(prompt_text))
         # Render the attachments in the chat history
         if uploaded_files:
             for file in uploaded_files:
@@ -278,10 +282,12 @@ if prompt := st.session_state.get("pending_prompt"):
         if final_answer:
             final_answer.additional_kwargs["activity"] = activity_steps
             final_answer.additional_kwargs["elapsed"] = time.monotonic() - started
-            final_answer.additional_kwargs["tables"] = answer_tables(sql_results, role)
-            if token_usage:
-                final_answer.additional_kwargs["token_usage"] = token_usage
-            archive_active_conversation()
+            try:
+                final_answer.additional_kwargs["tables"] = answer_tables(sql_results, role)
+                if token_usage:
+                    final_answer.additional_kwargs["token_usage"] = token_usage
+                archive_active_conversation()
+            except Exception as error:      # the answer itself is already in the history; only extras failed
+                st.session_state["last_error"] = f"The answer is shown, but its tables or history could not be saved: {error}"
 
-    st.session_state["pending_prompt"] = None
     st.rerun()      # enables the input again; the answer is shown from the chat history

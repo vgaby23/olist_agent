@@ -428,14 +428,14 @@ collected_results = contextvars.ContextVar("collected_results", default=None)
 def make_data_tools(role, user_id=None):
     """Buat tool data untuk SATU sesi login.
 
-    role dan user_id diambil dari halaman login, bukan dari LLM. Kalau user_id kosong, seller memakai
-    akun demo (demo_user_id); customer selalu anonim.
+    role dan user_id diambil dari halaman login, bukan dari LLM. Seller WAJIB punya user_id: tidak ada
+    fallback ke akun demo, supaya sesi tanpa id tidak diam-diam melihat data toko lain. Customer selalu anonim.
 
     Mengembalikan list berisi satu tool untuk supervisor: [ask_data_agent].
-    Raise ValueError kalau login tidak valid (role tidak dikenal atau id seller tidak ada di database),
+    Raise ValueError kalau login tidak valid (role tidak dikenal, id seller kosong atau tidak ada di database),
     supaya aplikasi bisa menolak sejak awal.
     """
-    scope = make_scope(role, user_id or demo_user_id(role))
+    scope = make_scope(role, user_id)
 
     @tool
     def ask_data_agent(question: str) -> str:

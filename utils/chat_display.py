@@ -1,9 +1,19 @@
+import re
+
 import streamlit as st
 import altair as alt
 from agent import supervisor_agent
 from langchain_core.messages import AIMessage
 from utils.chat_config import HIDDEN_COLUMNS, MAX_TABLES, STARTER_QUESTIONS, TIME_COLUMN
 from utils.chat_history import ask_chip
+
+
+UNESCAPED_DOLLAR = re.compile(r"(?<!\\)\$")
+
+
+def markdown_safe(text):
+    """Escape $ so Streamlit does not render the text between two prices ("R$13,237 ... R$13,169") as LaTeX math."""
+    return UNESCAPED_DOLLAR.sub(r"\\$", text or "")
 
 
 def latest_versions(tables):
@@ -79,7 +89,7 @@ def show_token_usage(message):
 
 def show_refusal(message, role, key, latest):
     """A refused request (agent/policy.py) as a notice, with allowed questions to try on the latest turn."""
-    st.info(supervisor_agent.clean_answer(message.text), icon="🔒")
+    st.info(markdown_safe(supervisor_agent.clean_answer(message.text)), icon="🔒")
     if latest:
         st.pills("You could ask instead", STARTER_QUESTIONS.get(role, [])[:3], key=f"refusal_chip_{key}",
                  on_change=ask_chip, args=(f"refusal_chip_{key}",))

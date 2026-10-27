@@ -88,7 +88,7 @@ out = search(company)
 check("company: order_id tetap terlihat", OTHER_ORDER in out)
 
 # ---------------------------------------------------------------- 4. tool supervisor per sesi login
-tools = rag_agent.make_review_tools("seller")
+tools = rag_agent.make_review_tools("seller", SELLER)
 args = set(inspect.signature(tools[0].func).parameters)
 check("ask_review_agent hanya punya argumen question", args == {"question"}, str(args))
 captured = []
@@ -106,6 +106,11 @@ check("role note seller menyebut id", SELLER in rag_agent.make_role_note(seller)
 check("role note customer: anonim", "anonymous" in rag_agent.make_role_note(customer))
 check("company tanpa role note", rag_agent.make_role_note(company) == "")
 check("make_review_tools customer tanpa id", len(rag_agent.make_review_tools("customer")) == 1)
+try:
+    rag_agent.make_review_tools("seller")
+    check("login seller tanpa id ditolak (tanpa fallback demo)", False)
+except ValueError:
+    check("login seller tanpa id ditolak (tanpa fallback demo)", True)
 
 print(f"\n{sum(results)}/{len(results)} passed")
 raise SystemExit(0 if all(results) else 1)

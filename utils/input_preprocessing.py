@@ -42,14 +42,19 @@ from pydantic import BaseModel, Field                    # noqa: E402
 # =============================================================================
 # Part 1: SETTINGS
 # =============================================================================
-VISION_MODEL = os.environ.get("VISION_MODEL", "gpt-4o-mini")   # any OpenAI chat model that can see images
+VISION_MODEL = os.environ.get("VISION_MODEL", "gpt-6-luna")    # any OpenAI chat model that can see images
 STT_MODEL = os.environ.get("STT_MODEL", "whisper-1")           # speech-to-text model
-# Spoken language as an ISO code. Without it Whisper guesses, and it often mis-heard Indonesian (even as Thai).
-# Set STT_LANGUAGE=auto in .env to let Whisper detect the language again.
-STT_LANGUAGE = os.environ.get("STT_LANGUAGE", "id")
-# A few words in the expected style help Whisper spell the domain words right (it is a hint, not a filter).
-STT_PROMPT = os.environ.get("STT_PROMPT", "Olist, ulasan, pembeli, penjual, sepatu, elektronik, kecantikan, "
-                                          "pengiriman, reais, Sao Paulo, Rio de Janeiro.")
+# Spoken language. "auto" (default) lets Whisper detect it, so English, Indonesian and Portuguese speakers all
+# work. Forcing one ISO code ("id", "en") breaks the other languages: English speech forced to "id" came back as
+# Indonesian words. Auto-detect sometimes mis-heard Indonesian as Thai, so when Whisper detects a language outside
+# SUPPORTED_SPEECH, the audio is transcribed again in STT_FALLBACK_LANGUAGE.
+STT_LANGUAGE = os.environ.get("STT_LANGUAGE", "auto")
+STT_FALLBACK_LANGUAGE = os.environ.get("STT_FALLBACK_LANGUAGE", "id")
+SUPPORTED_SPEECH = {"english", "indonesian", "portuguese", "en", "id", "pt"}
+# A few domain words help Whisper spell them right (a hint, not a filter). Mixed languages on purpose, so the
+# hint does not push language detection towards one of them.
+STT_PROMPT = os.environ.get("STT_PROMPT", "Olist, reviews, ulasan, avaliações, seller, penjual, reais, "
+                                          "Sao Paulo, Rio de Janeiro.")
 MAX_FILE_MB = 20                                               # refuse huge files before paying for them
 IMAGE_TYPES = {".jpg", ".jpeg", ".png", ".webp", ".gif"}
 AUDIO_TYPES = {".mp3", ".mp4", ".m4a", ".wav", ".webm", ".mpeg", ".mpga", ".ogg", ".flac"}
@@ -98,15 +103,28 @@ def voice_to_text(audio_path, language=None):
 
     options = {"model": STT_MODEL}
     language = (language or STT_LANGUAGE or "").strip().lower()
-    if language and language != "auto":
+    auto = not language or language == "auto"
+    if auto:
+        options["response_format"] = "verbose_json"     # also returns the detected language
+    else:
         options["language"] = language
     if STT_PROMPT:
         options["prompt"] = STT_PROMPT
+    client = OpenAI()
     with open(file, "rb") as audio:
-        result = OpenAI().audio.transcriptions.create(file=audio, **options)
+        result = client.audio.transcriptions.create(file=audio, **options)
+    detected = (getattr(result, "language", None) or "").lower()
+    if auto and detected and detected not in SUPPORTED_SPEECH and STT_FALLBACK_LANGUAGE:
+        # e.g. Indonesian heard as Thai: transcribe again in the fallback language
+        log.info("Whisper detected %r, transcribing again as %r", detected, STT_FALLBACK_LANGUAGE)
+        options.pop("response_format")
+        options["language"] = STT_FALLBACK_LANGUAGE
+        with open(file, "rb") as audio:
+            result = client.audio.transcriptions.create(file=audio, **options)
+        detected = STT_FALLBACK_LANGUAGE
     text = result.text.strip()
     # Logged so a wrong answer can be traced back to a mis-heard question.
-    log.info("Voice transcript (%s, language=%s): %r", STT_MODEL, options.get("language", "auto"), text)
+    log.info("Voice transcript (%s, language=%s): %r", STT_MODEL, options.get("language", detected or "auto"), text)
     if not text:
         raise InputError("I couldn't hear any words in the audio. Please try again.")
     return text

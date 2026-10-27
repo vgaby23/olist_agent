@@ -298,7 +298,10 @@ def task_only(agent):
 	def run(state, config):
 		task = next((call["args"].get("task", "") for message in reversed(state["messages"])
 		             for call in getattr(message, "tool_calls", None) or [] if call["name"] == call_name), "")
-		output = agent.invoke({"messages": [HumanMessage(content=task or state["messages"][0].text)]}, config)
+		if not task:    # no task written: fall back to the LATEST user message, not the first one of the chat
+			task = next((message.text for message in reversed(state["messages"])
+			             if isinstance(message, HumanMessage)), "")
+		output = agent.invoke({"messages": [HumanMessage(content=task)]}, config)
 		return {"messages": output["messages"][-1:]}
 
 	graph = StateGraph(MessagesState)

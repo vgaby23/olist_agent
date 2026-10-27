@@ -16,7 +16,7 @@ from langchain_openai import ChatOpenAI
 
 load_dotenv()
 
-DEFAULT_MODEL = "gpt-4o-mini"
+DEFAULT_MODEL = "gpt-6-luna"
 
 # Model names starting with these do not accept temperature (only the default sampling).
 NO_TEMPERATURE_PREFIXES = ("o1", "o3", "o4", "gpt-5", "gpt-6")
@@ -38,7 +38,7 @@ def supports_temperature(model):
 
 
 def chat_model(model=None, temperature=0, **kwargs):
-    """ChatOpenAI for `model` (default: LLM_MODEL from .env, else gpt-4o-mini).
+    """ChatOpenAI for `model` (default: LLM_MODEL from .env, else gpt-6-luna).
     `temperature` is only sent when the model supports it."""
     model = model or os.getenv("LLM_MODEL") or DEFAULT_MODEL
     if temperature is not None and supports_temperature(model):

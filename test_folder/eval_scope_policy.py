@@ -1,7 +1,7 @@
 """
 eval_scope_policy.py - does the supervisor's pre-check (check_request_scope) follow agent/policy.py?
 
-Sends allowed and forbidden questions per role to the REAL pre-check (an LLM call each, gpt-4o-mini) and
+Sends allowed and forbidden questions per role to the REAL pre-check (an LLM call each, gpt-6-luna by default) and
 compares allowed / denied and the rule id. The pre-check is only the FIRST layer: forbidden requests that
 slip through are still blocked in code by sql_tools.py and rag_agent.apply_scope (see the security tests).
 
