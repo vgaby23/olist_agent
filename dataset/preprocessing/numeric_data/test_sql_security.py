@@ -1,11 +1,17 @@
 """
 test_sql_security.py - Tes OFFLINE (tanpa OpenAI) untuk sql_tools.py dan alur sql_agent.py.
 
-Menguji: validasi SQL, scope per role, tool per sesi login, authorizer, batas baris/waktu,
-angka referensi fitur Seller P0, dan alur ask_sql_agent dengan LLM palsu.
+Yang diuji:
+  1.  Validasi SQL: perintah tulis, banyak perintah sekaligus, dan akses objek internal ditolak.
+  2.  Scope per role: seller hanya melihat datanya sendiri, customer anonim hanya melihat tabel umum dan
+      view agregat, dan id pembeli disamarkan (pseudonim) untuk seller.
+  3.  Batas jumlah baris, waktu query, dan ukuran nilai.
+  3b. Nilai uang seller pada order yang juga berisi barang seller lain.
+  3c. Kebersihan nama kota seller.
+  4.  Angka referensi fitur Seller P0 (income trend, customer behavior, most-loved categories).
+  5.  Alur ask_sql_agent dan tool untuk supervisor, memakai LLM palsu (FakeLLM).
 
-Jalankan dari folder utama proyek:
-    python -m dataset.preprocessing.numeric_data.test_sql_security
+Setiap tes mencetak [PASS] atau [FAIL]; script keluar dengan kode 1 kalau ada tes yang gagal.
 """
 import inspect
 
@@ -14,22 +20,26 @@ from dataset.preprocessing.numeric_data.sql_tools import get_monthly_revenue, ma
 SELLER = "4869f7a5dfa277a7dca6462dcf3b52b2"        # seller dengan revenue tertinggi
 OTHER_SELLER = "53243585a1d6dc2643021fd1853d8905"  # seller lain
 REAL_CUSTOMER = "8d50f5eadf50201ccdcedfb9e2ac8455" # customer_unique_id asli (tidak boleh terlihat oleh seller)
+# tabel transaksi yang tidak boleh dibaca customer anonim
 PRIVATE_TABLES = ["orders", "order_items", "order_payments", "order_reviews", "customers", "sellers"]
 
+# Query revenue (order delivered, periode default); dipakai untuk membandingkan hasil company vs seller
 REVENUE = ("SELECT ROUND(SUM(oi.price), 2) AS revenue, COUNT(DISTINCT oi.seller_id) AS sellers "
            "FROM order_items oi JOIN orders o ON o.order_id = oi.order_id "
            "WHERE o.is_delivered = 1 AND o.in_trend_period = 1")
 
-results = []
+results = []        # hasil semua tes (True = PASS)
 
 
 def check(name, condition, detail=""):
+    """Catat hasil satu tes dan cetak [PASS] / [FAIL] beserta detailnya (kalau ada)."""
     condition = bool(condition)
     results.append(condition)
     print(f"[{'PASS' if condition else 'FAIL'}] {name}" + (f"  ({detail})" if detail else ""))
 
 
 def raises(func, *args, **kwargs):
+    """Jalankan func. Kembalikan pesan error kalau func gagal, atau None kalau berhasil."""
     try:
         func(*args, **kwargs)
     except Exception as error:
@@ -38,6 +48,7 @@ def raises(func, *args, **kwargs):
 
 
 def value(sql, scope=None):
+    """Jalankan query dan kembalikan satu nilai: baris pertama, kolom pertama."""
     return run_query(sql, scope=scope).iloc[0, 0]
 
 
@@ -76,17 +87,17 @@ bypass = raises(run_query, 'SELECT COUNT(*) FROM "main"."order_items"', seller)
 check("seller: bypass lewat \"main\".\"order_items\" ditolak authorizer", bypass is not None, bypass)
 check("company: \"main\".\"order_items\" boleh", value('SELECT COUNT(*) FROM "main"."order_items"') == 112650)
 
-# customer anonim (aturan C1-C5 di agent/policy.py): tabel transaksi tertutup, hanya agregat umum
+# customer anonim: tabel transaksi tertutup, yang terbuka hanya tabel umum dan view agregat
 for table in PRIVATE_TABLES:
     check(f"customer: SELECT kolom {table} ditolak", raises(run_query, f"SELECT * FROM {table} LIMIT 1", customer))
-    # COUNT(*) tidak membaca kolom; SQLite melaporkannya dengan db_name None (celah lama di authorizer)
+    # COUNT(*) tidak membaca kolom; SQLite melaporkannya dengan db_name None (kasus khusus di authorizer)
     check(f"customer: COUNT(*) {table} ditolak", raises(run_query, f"SELECT COUNT(*) FROM {table}", customer))
 check("customer: subquery ke tabel tertutup ditolak", raises(
     run_query, "SELECT category FROM category_stats WHERE category IN (SELECT seller_id FROM sellers)", customer))
 check("customer: products & br_states tetap terbuka", value("SELECT COUNT(*) FROM products", customer) == 32951
       and value("SELECT COUNT(*) FROM br_states", customer) == 27)
 check("customer: category_stats terbuka", value("SELECT COUNT(*) FROM category_stats", customer) > 50)
-# C5: items_sold x avg_price yang persis = omzet platform; customer hanya dapat rentang kasar
+# customer tidak boleh mendapat angka persis (items_sold x avg_price = omzet platform), hanya urutan dan rentang
 check("customer: items_sold/avg_price/review_count persis tidak ada",
       all(raises(run_query, f"SELECT SUM({col}) FROM {view}", customer) is not None
           for col in ("items_sold", "avg_price", "review_count") for view in ("category_stats", "product_stats")))
@@ -100,7 +111,7 @@ check("customer: seller_stats tanpa items_sold/avg_price/review_count persis",
           for col in ("items_sold", "avg_price", "review_count")))
 check("customer: sales_rank seller per kategori", value(
     "SELECT COUNT(DISTINCT category) FROM seller_stats WHERE sales_rank = 1", customer) > 50)
-# S1/S2: seller melihat agregat per produk & per seller yang sama dengan customer, benchmark kategori tetap persis
+# seller melihat product_stats & seller_stats versi customer, tetapi benchmark category_stats tetap persis
 check("seller: product_stats & seller_stats tanpa angka persis",
       all(raises(run_query, f"SELECT SUM(items_sold) FROM {view}", seller) is not None
           for view in ("product_stats", "seller_stats")))
@@ -108,7 +119,7 @@ check("seller: category_stats tetap persis", value("SELECT SUM(items_sold) FROM 
 check("company: seller_stats persis", value("SELECT SUM(items_sold) FROM seller_stats") > 100_000)
 check("customer: state_delivery_stats terbuka", value("SELECT COUNT(*) FROM state_delivery_stats", customer) == 27)
 
-# seller: pembeli tanpa id asli & tanpa kode pos (aturan S3), agregat tetap benar
+# seller: pembeli tanpa id asli & tanpa kode pos, tetapi hasil agregat tetap benar
 cols = list(run_query("SELECT * FROM customers LIMIT 1", seller).columns)
 check("seller: customers tanpa kode pos", "customer_zip_code_prefix" not in cols, cols)
 ids = run_query("SELECT customer_id, customer_unique_id FROM customers LIMIT 5", seller)
@@ -120,7 +131,7 @@ check("seller: pseudonim cocok di JOIN orders-customers", value(
       == value("SELECT COUNT(*) FROM orders", seller))
 true_buyers = value(f"""SELECT COUNT(DISTINCT c.customer_unique_id) FROM orders o
     JOIN customers c ON c.customer_id = o.customer_id
-    WHERE o.order_id IN (SELECT order_id FROM order_items WHERE seller_id = '{SELLER}')""")   # company scope
+    WHERE o.order_id IN (SELECT order_id FROM order_items WHERE seller_id = '{SELLER}')""")   # scope company
 check("seller: jumlah pembeli unik sama dengan data asli",
       value("SELECT COUNT(DISTINCT customer_unique_id) FROM customers", seller) == true_buyers, true_buyers)
 
@@ -186,7 +197,7 @@ check("most-loved categories (se-platform)", len(loved) == 3, loved.to_dict("rec
 try:
     from agent.sql_agent import ask_sql_agent, make_data_tools, period_note
     from dataset.preprocessing.numeric_data.sql_tools import get_schema
-except ImportError as error:
+except ImportError as error:        # modul agent / LangChain tidak tersedia -> tes agent dilewati
     print(f"[SKIP] tes agent: {error}")
 else:
     from langchain_core.language_models import BaseChatModel
@@ -195,8 +206,9 @@ else:
     from pydantic import Field
 
     class FakeLLM(BaseChatModel):
-        """Chat model palsu untuk agent LangChain: mengembalikan jawaban berurutan dan mencatat prompt yang
-        diterima. Jawaban berupa teks biasa, atau AIMessage dengan tool_calls (lihat sql_call)."""
+        """Chat model palsu untuk tes tanpa OpenAI.
+        Mengembalikan balasan dari replies secara berurutan dan mencatat setiap prompt yang diterima di prompts.
+        Balasan bisa berupa teks biasa, atau AIMessage dengan tool_calls (dibuat oleh sql_call)."""
         replies: list
         prompts: list = Field(default_factory=list)
 
@@ -204,7 +216,7 @@ else:
         def _llm_type(self):
             return "fake"
 
-        def bind_tools(self, tools, **kwargs):
+        def bind_tools(self, tools, **kwargs):     # tool tidak perlu diikat: balasan sudah ditentukan di replies
             return self
 
         def _generate(self, messages, stop=None, run_manager=None, **kwargs):
@@ -266,12 +278,15 @@ else:
 
     # tool per sesi login: role & id dikunci, LLM hanya mengisi pertanyaan
     def tool_name(t):
+        """Nama tool (objek tool LangChain atau fungsi biasa)."""
         return getattr(t, "name", None) or t.__name__
 
     def tool_args(t):
+        """Himpunan nama argumen tool."""
         return set(t.args) if hasattr(t, "args") else set(inspect.signature(t).parameters)
 
     def call(t, **kwargs):
+        """Panggil tool dengan argumen kwargs."""
         return t.invoke(kwargs) if hasattr(t, "invoke") else t(**kwargs)
 
     seller_tools = make_data_tools("seller", SELLER)

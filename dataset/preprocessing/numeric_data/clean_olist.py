@@ -1,23 +1,30 @@
 """
-Cleaning dataset Olist -> SQLite (untuk SQL Agent).
-(Data review untuk RAG ada di Qdrant, dibuat oleh dataset/preprocessing/vector_data/text_ingest.py.)
+clean_olist.py - Cleaning dataset Olist (CSV) menjadi database SQLite untuk SQL Agent.
 
-Prinsip: CSV mentah tidak diubah; hasil bersih ditulis ke olist.db baru.
+Prinsip: file CSV mentah tidak diubah; hasil bersih ditulis ke file olist.db yang baru
+(file lama dihapus dan dibuat ulang setiap kali script dijalankan).
 
-Cara pakai (dari folder utama proyek):
-    python dataset/preprocessing/numeric_data/clean_olist.py
+Argumen command line:
+    --data-dir     folder yang berisi raw_data/*.csv (default ./dataset)
+    --out-dir      folder tujuan olist.db (default ./dataset)
+    --review-pick  ulasan yang dipakai kalau satu order punya lebih dari satu ulasan:
+                   "first" (default) atau "latest"
 
 Aturan cleaning:
-    - revenue = SUM(order_items.price) dari order delivered; order lain tidak dihapus, hanya ditandai
-    - periode analisis 2017-01 s/d 2018-08 (kolom purchase_month, purchase_year, in_trend_period)
-    - ulasan ganda: ulasan PERTAMA per order dipakai (pendapat final pembeli); teks ulasan tidak disimpan
-    - produk tanpa kategori: 'uncategorized'; dua kategori tanpa terjemahan ditambahkan
-    - pembayaran: not_defined dibuang, cicilan 0 -> 1, voucher bernilai 0 -> NULL
-    - kota seller dibersihkan (clean_city); data customer tidak diubah
-    - is_late dibandingkan per tanggal (estimasi pengiriman selalu jam 00:00)
+    - Order tidak dihapus, hanya ditandai. Revenue = SUM(order_items.price) dari order delivered.
+    - Periode analisis 2017-01 s.d. 2018-08 (kolom purchase_month, purchase_year, in_trend_period).
+    - Ulasan ganda: ulasan PERTAMA per order yang dipakai; teks ulasan tidak disimpan.
+    - Produk tanpa kategori diberi label 'uncategorized'; dua kategori yang belum punya terjemahan ditambahkan.
+    - Pembayaran: tipe not_defined dibuang, cicilan 0 -> 1, voucher bernilai 0 -> NULL.
+    - Nama kota seller dibersihkan (clean_city); data customer tidak diubah.
+    - is_late dibandingkan per tanggal, karena estimasi pengiriman selalu tercatat jam 00:00.
 
-Hasil:
-    dataset/olist.db          -> database SQLite bersih
+Kolom tambahan di tabel orders:
+    is_delivered, purchase_month, purchase_year, in_trend_period, is_late, delivery_days,
+    items_value, freight_total, n_items, order_total.
+
+Tabel di olist.db:
+    customers, sellers, br_states, products, orders, order_items, order_payments, order_reviews.
 """
 import argparse
 import os
@@ -28,19 +35,19 @@ import unicodedata
 import numpy as np
 import pandas as pd
 
-# Rentang tren yang valid: data sebelum 2017-01 dan sesudah 2018-08 parsial
+# Periode analisis (tren); data sebelum 2017-01 dan sesudah 2018-08 tidak lengkap
 TREND_START, TREND_END = "2017-01", "2018-08"
 
 # Label untuk produk tanpa kategori
 UNCATEGORIZED = "uncategorized"
 
-# Dua kategori yang tidak ada di file terjemahan
+# Terjemahan untuk dua kategori yang tidak ada di file product_category_name_translation.csv
 EXTRA_TRANSLATIONS = {
     "pc_gamer": "pc_gamer",
     "portateis_cozinha_e_preparadores_de_alimentos": "portable_kitchen_and_food_preparers",
 }
 
-# Lookup kode negara bagian Brasil -> nama
+# Kode negara bagian Brasil -> (nama negara bagian, wilayah); disimpan sebagai tabel br_states
 BR_STATES = {
     "AC": ("Acre", "North"), "AL": ("Alagoas", "Northeast"), "AP": ("Amapá", "North"),
     "AM": ("Amazonas", "North"), "BA": ("Bahia", "Northeast"), "CE": ("Ceará", "Northeast"),
@@ -55,8 +62,8 @@ BR_STATES = {
 }
 
 
-# Kota seller: salah ketik yang diperbaiki manual (dicek satu per satu; sengaja tidak pakai fuzzy otomatis
-# karena 'sao jose do rio pardo' dan 'itapeva' adalah kota asli yang mirip kota lain)
+# Salah ketik nama kota seller yang diperbaiki manual. Sengaja tidak memakai pencocokan fuzzy otomatis,
+# karena ada kota asli yang namanya mirip kota lain (mis. 'sao jose do rio pardo' dan 'itapeva').
 CITY_FIXES = {
     "sp": "sao paulo", "sao paulo sp": "sao paulo", "sao pauo": "sao paulo", "sao paluo": "sao paulo",
     "sao paulop": "sao paulo", "sbc": "sao bernardo do campo", "sao bernardo do capo": "sao bernardo do campo",
@@ -72,8 +79,9 @@ CITY_FIXES = {
 
 
 def clean_city(city):
-    """Nama kota seragam: huruf kecil tanpa aksen, buang '/ sp', '- sp', ', brasil', '(...)'.
-    Mengembalikan None kalau isinya bukan nama kota (angka, email)."""
+    """Seragamkan nama kota: huruf kecil tanpa aksen, buang akhiran seperti '/ sp', '- sp', ', brasil', '(...)',
+    lalu perbaiki salah ketik lewat CITY_FIXES.
+    Mengembalikan None kalau isinya bukan nama kota (mis. angka atau email)."""
     if pd.isna(city):
         return None
     city = unicodedata.normalize("NFKD", str(city)).encode("ascii", "ignore").decode().lower()
@@ -85,7 +93,9 @@ def clean_city(city):
 
 
 def clean_seller_cities(sellers):
-    """clean_city untuk seller; kalau gagal, ambil kota terbanyak dari seller lain dengan zip prefix sama."""
+    """Bersihkan kolom seller_city dengan clean_city.
+    Kalau hasilnya None, isi dengan kota yang paling sering dipakai seller lain dengan zip prefix yang sama;
+    kalau tetap tidak ada, isi 'unknown'."""
     sellers["seller_city"] = sellers["seller_city"].map(clean_city)
     by_zip = (sellers.dropna(subset=["seller_city"])
               .groupby("seller_zip_code_prefix")["seller_city"].agg(lambda c: c.value_counts().index[0]))
@@ -96,17 +106,19 @@ def clean_seller_cities(sellers):
 
 
 def read(data_dir, name, **kw):
+    """Baca satu file CSV dari data_dir (encoding utf-8-sig supaya BOM di awal file ikut terbuang)."""
     return pd.read_csv(os.path.join(data_dir, name), encoding="utf-8-sig", **kw)
 
 
 def fmt_dates(df, cols):
-    """Simpan tanggal sebagai TEXT 'YYYY-MM-DD HH:MM:SS' (NULL kalau kosong)."""
+    """Ubah kolom tanggal menjadi TEXT 'YYYY-MM-DD HH:MM:SS' (NULL kalau kosong), format yang dipakai di SQLite."""
     for c in cols:
         df[c] = df[c].dt.strftime("%Y-%m-%d %H:%M:%S")
     return df
 
 
 def main():
+    """Baca semua CSV, bersihkan, tulis ke olist.db, buat index, lalu cetak ringkasan validasi."""
     parser = argparse.ArgumentParser()
     parser.add_argument("--data-dir", default="./dataset")
     parser.add_argument("--out-dir", default="./dataset")
@@ -145,8 +157,8 @@ def main():
 
     # ------------------------------------------------------------------ PAYMENTS
     payments = read(d, "raw_data/olist_order_payments_dataset.csv")
-    payments = payments[payments["payment_type"] != "not_defined"].copy()           # 3 baris (order canceled)
-    payments.loc[payments["payment_installments"] == 0, "payment_installments"] = 1  # 2 baris credit card
+    payments = payments[payments["payment_type"] != "not_defined"].copy()           # buang 3 baris (order canceled)
+    payments.loc[payments["payment_installments"] == 0, "payment_installments"] = 1  # cicilan 0 -> 1 (2 baris)
     # voucher bernilai 0 -> NULL: SUM tidak berubah, AVG otomatis melewatinya
     payments["payment_value"] = payments["payment_value"].astype(float)
     payments.loc[(payments["payment_type"] == "voucher") & (payments["payment_value"] == 0),
@@ -160,7 +172,7 @@ def main():
     if args.review_pick == "first":    # default: ulasan pertama = pendapat final pembeli
         reviews = reviews.sort_values(["order_id", "review_creation_date", "review_answer_timestamp"]
                                       ).drop_duplicates("order_id", keep="first")
-    else:                              # alternatif: review_answer_timestamp terbaru
+    else:                              # alternatif: ulasan dengan review_answer_timestamp terbaru
         reviews = reviews.sort_values(["order_id", "review_answer_timestamp"]).drop_duplicates("order_id", keep="last")
     reviews = fmt_dates(reviews, ["review_creation_date", "review_answer_timestamp"])
 
@@ -173,12 +185,13 @@ def main():
     orders["is_delivered"] = ((orders["order_status"] == "delivered")
                               & orders["order_delivered_customer_date"].notna()).astype(int)
 
-    # Kolom periode dibuat saat cleaning (agent tidak memotong timestamp sendiri)
+    # Kolom periode dibuat saat cleaning, supaya agent tidak perlu memotong timestamp sendiri
     orders["purchase_month"] = orders["order_purchase_timestamp"].dt.strftime("%Y-%m")
     orders["purchase_year"] = orders["order_purchase_timestamp"].dt.year.astype(int)
     orders["in_trend_period"] = orders["purchase_month"].between(TREND_START, TREND_END).astype(int)
 
     # Pengiriman: tanggal estimasi selalu jam 00:00, jadi bandingkan TANGGAL-nya saja.
+    # is_late dan delivery_days hanya diisi untuk order delivered; order lain NULL.
     delivered = orders["is_delivered"] == 1
     orders["is_late"] = np.where(
         delivered,
@@ -205,7 +218,7 @@ def main():
 
     # ------------------------------------------------------------------ TULIS KE SQLITE
     db_path = os.path.join(args.out_dir, "olist.db")
-    if os.path.exists(db_path):
+    if os.path.exists(db_path):          # database selalu dibuat ulang dari awal
         os.remove(db_path)
     conn = sqlite3.connect(db_path)
     tables = {"customers": customers, "sellers": sellers, "br_states": br_states, "products": products,
@@ -213,6 +226,7 @@ def main():
     for name, df in tables.items():
         df.to_sql(name, conn, index=False)
 
+    # Index: mempercepat JOIN / filter dan memastikan kolom kunci unik
     indexes = [
         "CREATE UNIQUE INDEX ix_customers_pk  ON customers(customer_id)",
         "CREATE INDEX        ix_customers_uid ON customers(customer_unique_id)",
@@ -233,7 +247,7 @@ def main():
     conn.commit()
 
     # ------------------------------------------------------------------ VALIDASI SINGKAT
-    q = lambda sql: conn.execute(sql).fetchone()[0]
+    q = lambda sql: conn.execute(sql).fetchone()[0]       # jalankan query, ambil satu nilai
     print("database                  :", db_path, f"({os.path.getsize(db_path) / 1e6:.0f} MB)")
     for name in tables:
         print(f"  {name:<24}:", q(f"SELECT COUNT(*) FROM {name}"))

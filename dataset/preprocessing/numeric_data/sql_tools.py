@@ -1,32 +1,40 @@
 """
-sql_tools.py - Akses aman ke database SQLite Olist (data/olist.db) untuk SQL Agent.
+sql_tools.py - Akses aman ke database SQLite Olist (olist.db) untuk SQL Agent.
 
-Lapisan keamanan saat menjalankan SQL dari LLM:
-  1. validate_query  : hanya SATU perintah SELECT / WITH; kata kunci tulis & bypass (main., temp., sqlite_,
-                       ATTACH, PRAGMA, ...) ditolak.
-  2. koneksi read-only (mode=ro): database tidak bisa diubah sama sekali.
-  3. scope per role  : untuk seller dibuat TEMP VIEW dengan nama yang sama dengan tabel asli, sudah difilter ke
-                       seller itu. SQLite mencari di schema temp lebih dulu, jadi SQL biasa (FROM order_items ...)
-                       hanya melihat baris milik seller itu. Customer = pembeli ANONIM (tanpa id): tidak ada view
-                       transaksi sama sekali, hanya view agregat umum (category_stats, product_stats,
-                       seller_stats, state_delivery_stats) + tabel umum. Seller mendapat product_stats &
-                       seller_stats versi customer (tanpa omzet seller lain) + category_stats persis.
-  4. authorizer      : untuk seller/customer, membaca tabel main secara langsung (di luar view) ditolak,
+Lokasi database diatur oleh DB_PATH: default olist.db di folder Dataset, atau path dari env OLIST_DB_PATH.
+
+Lapisan keamanan saat menjalankan SQL buatan LLM:
+  1. validate_query  : hanya boleh SATU perintah SELECT / WITH. Kata kunci untuk menulis data atau mengakali
+                       pembatasan (INSERT, DROP, ATTACH, PRAGMA, main., temp., sqlite_, ...) ditolak.
+  2. Koneksi read-only (mode=ro): isi database tidak bisa diubah sama sekali.
+  3. Scope per role  : untuk seller dibuat TEMP VIEW dengan nama yang sama dengan tabel asli, yang sudah
+                       difilter ke seller itu. SQLite mencari di schema temp lebih dulu, jadi query biasa
+                       (FROM order_items ...) hanya melihat baris milik seller itu.
+  4. Authorizer      : untuk seller/customer, membaca tabel asli secara langsung (di luar view) ditolak,
                        kecuali tabel umum (products, br_states). Ini menutup celah seperti "main"."order_items".
-                       Untuk customer berarti: orders, order_items, customers, sellers, dst. tidak bisa dibaca.
-  5. batas waktu, memori & baris: query terlalu lama dihentikan; satu nilai maksimal 10 MB;
-                       hasil dipotong di MAX_ROWS (ditandai truncated).
-Untuk seller, orders.items_value/freight_total/n_items/order_total dihitung ulang dari barang seller itu saja,
-dan order_payments.payment_value dibagi sesuai porsi seller itu dalam order (order bisa berisi barang seller lain).
-Untuk seller, customer_id/customer_unique_id diganti pseudonim (aturan S3 di agent/policy.py) dan kode pos
-dibuang: hitungan pembeli & repeat purchase tetap benar, tapi pembeli asli tidak bisa dikenali.
+  5. Batas waktu, memori, dan baris: query yang terlalu lama dihentikan, satu nilai maksimal 10 MB,
+                       dan hasil dipotong di MAX_ROWS baris (ditandai attrs["truncated"]).
+
+Data yang bisa dilihat tiap role:
+  - company : semua tabel dan view, dengan angka persis.
+  - seller  : hanya transaksi miliknya sendiri.
+      * orders.items_value / freight_total / n_items / order_total dihitung ulang dari barang seller itu saja.
+      * order_payments.payment_value dibagi sesuai porsi seller itu dalam order
+        (satu order bisa berisi barang dari beberapa seller).
+      * customer_id / customer_unique_id diganti pseudonim dan kode pos dibuang: jumlah pembeli dan
+        repeat purchase tetap benar, tetapi pembeli asli tidak bisa dikenali.
+      * category_stats memakai angka persis; product_stats dan seller_stats memakai versi customer
+        (tanpa angka persis), supaya omzet seller lain tidak terlihat.
+  - customer: pembeli ANONIM (tanpa id). Tabel transaksi tidak bisa dibaca sama sekali; yang terbuka hanya
+              tabel umum (products, br_states) dan view agregat se-platform (category_stats, product_stats,
+              seller_stats tanpa angka persis, plus state_delivery_stats).
 
 Fungsi utama:
-  get_connection()                 -> koneksi read-only (untuk query internal yang sudah aman / berparameter)
-  get_schema()                     -> deskripsi skema untuk prompt LLM
-  make_scope(role, user_id)        -> Scope tervalidasi
-  run_query(sql, scope)            -> DataFrame (attrs["truncated"] = True kalau dipotong)
-  get_monthly_revenue(role, uid)   -> DataFrame tren pendapatan bulanan (untuk grafik / forecasting)
+  get_connection()                 -> koneksi read-only (untuk query internal yang aman / berparameter)
+  get_schema(role)                 -> teks skema database untuk prompt LLM
+  make_scope(role, user_id)        -> Scope yang sudah divalidasi
+  run_query(sql, scope)            -> DataFrame hasil query (attrs["truncated"] = True kalau dipotong)
+  get_monthly_revenue(role, uid)   -> DataFrame pendapatan bulanan (untuk grafik / forecasting)
 """
 import hashlib
 import hmac
@@ -49,10 +57,10 @@ QUERY_TIMEOUT_S = 15     # detik maksimum per query
 MAX_VALUE_BYTES = 10_000_000   # ukuran maksimum satu nilai string/blob (batas memori)
 
 ROLES = ("company", "seller", "customer")
-ID_PATTERN = re.compile(r"[0-9a-f]{32}")     # seller_id / customer_unique_id Olist
-PUBLIC_TABLES = {"products", "br_states"}    # data produk umum: boleh dibaca semua role
+ID_PATTERN = re.compile(r"[0-9a-f]{32}")     # format id Olist: 32 karakter hex
+PUBLIC_TABLES = {"products", "br_states"}    # tabel umum yang boleh dibaca semua role
 
-# Kata yang tidak boleh ada di SQL dari LLM (dicek sebagai kata utuh, di luar string literal)
+# Kata kunci yang tidak boleh ada di SQL dari LLM (dicek sebagai kata utuh, setelah isi string & komentar dibuang)
 FORBIDDEN = re.compile(
     r"\b(INSERT|UPDATE|DELETE|DROP|ALTER|CREATE|ATTACH|DETACH|PRAGMA|VACUUM|REINDEX|ANALYZE|"
     r"TRANSACTION|BEGIN|COMMIT|ROLLBACK|SAVEPOINT|RELEASE|LOAD_EXTENSION)\b"
@@ -81,8 +89,8 @@ COLUMN_NOTES = {
     "customers.customer_city": "lowercase without accents, e.g. 'sao paulo'",
 }
 
-# Statistik kategori se-platform (data produk umum, tanpa seller_id/customer) -> boleh untuk semua role.
-# Semua tabel ditulis dengan prefix main. supaya view ini tidak ikut terfilter oleh scope.
+# Statistik per kategori se-platform (tanpa data seller/customer), boleh untuk semua role.
+# Semua tabel ditulis dengan prefix main. supaya view ini membaca tabel asli, bukan TEMP VIEW milik scope seller.
 CATEGORY_STATS_SELECT = """
 WITH items AS (
     SELECT oi.order_id, p.product_category_name_english AS category, oi.price
@@ -113,7 +121,8 @@ CATEGORY_STATS_NOTE = (
     "avg_review_score REAL"
 )
 
-# Statistik per produk se-platform (tanpa seller/customer) -> boleh untuk semua role, termasuk customer anonim.
+# Statistik per produk se-platform (tanpa data seller/customer). Versi angka persis ini hanya untuk company;
+# seller dan customer memakai CUSTOMER_PRODUCT_STATS_VIEW.
 PRODUCT_STATS_SELECT = """
 WITH items AS (
     SELECT oi.order_id, oi.product_id, p.product_category_name_english AS category, oi.price
@@ -142,7 +151,7 @@ PRODUCT_STATS_NOTE = (
     "product_id TEXT, category TEXT, items_sold INTEGER, avg_price REAL, review_count INTEGER, avg_review_score REAL"
 )
 
-# Lama & ketepatan pengiriman per state pembeli se-platform (agregat, tanpa id) -> boleh untuk semua role.
+# Lama & ketepatan pengiriman per state pembeli se-platform (agregat, tanpa id), boleh untuk semua role.
 STATE_DELIVERY_VIEW = """
 CREATE TEMP VIEW state_delivery_stats AS
 SELECT c.customer_state AS state_code, s.state_name,
@@ -160,7 +169,8 @@ STATE_DELIVERY_NOTE = (
     "state_code TEXT, state_name TEXT, delivered_orders INTEGER, avg_delivery_days REAL, late_pct REAL"
 )
 
-# Statistik per seller per kategori se-platform (untuk rekomendasi seller, mis. "5 seller review terbaik untuk make up").
+# Statistik per seller per kategori se-platform (untuk rekomendasi seller, mis. "5 seller review terbaik untuk
+# make up"). Versi angka persis ini hanya untuk company; seller dan customer memakai CUSTOMER_SELLER_STATS_VIEW.
 SELLER_STATS_SELECT = """
 WITH items AS (
     SELECT oi.order_id, oi.seller_id, p.product_category_name_english AS category, oi.price
@@ -195,11 +205,12 @@ SELLER_STATS_NOTE = (
 PUBLIC_VIEWS = [CATEGORY_STATS_VIEW, PRODUCT_STATS_VIEW, STATE_DELIVERY_VIEW, SELLER_STATS_VIEW]
 PUBLIC_VIEW_NOTES = [CATEGORY_STATS_NOTE, PRODUCT_STATS_NOTE, STATE_DELIVERY_NOTE, SELLER_STATS_NOTE]
 
-# Customer anonim (aturan C5): items_sold x avg_price yang persis = omzet platform (selisih ~R$60 dari aslinya).
-# Rentang kasar saja tidak cukup: dengan titik tengah rentang, jumlah ~70 kategori tetap memberi ~90% omzet asli
-# (galatnya saling menutupi), dan review_count persis x harga juga (~95%). Jadi customer tidak mendapat besaran
-# volume sama sekali: penjualan hanya sebagai urutan (sales_rank), jumlah ulasan hanya sebagai label yang dibatasi
-# ('100 or more'), harga sebagai rentang (price_band) + urutan (price_level).
+# Versi view untuk customer (sebagian juga untuk seller) tanpa angka volume persis.
+# Alasannya: items_sold x avg_price yang persis sama dengan omzet platform (selisih hanya ~R$60).
+# Rentang kasar saja juga tidak cukup: dengan titik tengah rentang, jumlah dari ~70 kategori tetap memberi ~90%
+# omzet asli (galatnya saling menutupi), dan review_count persis x harga memberi ~95%.
+# Jadi penjualan hanya diberikan sebagai urutan (sales_rank), jumlah ulasan sebagai label yang dibatasi
+# ('100 or more'), dan harga sebagai rentang (price_band) + urutan (price_level).
 PRICE_LEVEL = """CASE WHEN avg_price < 25 THEN 1 WHEN avg_price < 50 THEN 2 WHEN avg_price < 100 THEN 3
     WHEN avg_price < 200 THEN 4 WHEN avg_price < 500 THEN 5 ELSE 6 END"""
 PRICE_BAND = """CASE WHEN avg_price < 25 THEN 'under R$25' WHEN avg_price < 50 THEN 'R$25-49'
@@ -236,20 +247,21 @@ CUSTOMER_VIEWS = [CUSTOMER_CATEGORY_STATS_VIEW, CUSTOMER_PRODUCT_STATS_VIEW, STA
                   CUSTOMER_SELLER_STATS_VIEW]
 CUSTOMER_VIEW_NOTES = [CUSTOMER_CATEGORY_STATS_NOTE, CUSTOMER_PRODUCT_STATS_NOTE, STATE_DELIVERY_NOTE,
                        CUSTOMER_SELLER_STATS_NOTE]
-# Seller (aturan S1/S2): agregat per produk & per seller sama dengan customer (tanpa omzet seller lain), tapi
-# benchmark kategori tetap persis.
+# Seller: product_stats dan seller_stats sama dengan versi customer (tanpa omzet seller lain), tetapi
+# category_stats tetap memakai angka persis sebagai benchmark kategori.
 SELLER_VIEWS = [CATEGORY_STATS_VIEW] + CUSTOMER_VIEWS[1:]
 SELLER_VIEW_NOTES = [CATEGORY_STATS_NOTE] + CUSTOMER_VIEW_NOTES[1:]
+# View dan deskripsinya (untuk prompt LLM) per role
 VIEWS = {"company": PUBLIC_VIEWS, "seller": SELLER_VIEWS, "customer": CUSTOMER_VIEWS}
 VIEW_NOTES = {"company": PUBLIC_VIEW_NOTES, "seller": SELLER_VIEW_NOTES, "customer": CUSTOMER_VIEW_NOTES}
 
-# Kunci acak per proses untuk pseudonim pembeli (seller). Sama selama aplikasi berjalan, jadi COUNT DISTINCT dan
-# JOIN tetap benar; tidak bisa dibalik ke id asli.
+# Kunci acak per proses untuk pseudonim pembeli (dipakai di view seller). Kuncinya sama selama aplikasi berjalan,
+# jadi COUNT DISTINCT dan JOIN tetap benar; pseudonim tidak bisa dibalik ke id asli.
 _PSEUDONYM_KEY = secrets.token_bytes(16)
 
 
 def _pseudonym(value):
-    """customer id -> 'cust_' + 12 hex (HMAC). None tetap None."""
+    """Ubah customer id menjadi pseudonim 'cust_' + 12 karakter hex (HMAC-SHA256). None tetap None."""
     if value is None:
         return None
     return "cust_" + hmac.new(_PSEUDONYM_KEY, str(value).encode(), hashlib.sha256).hexdigest()[:12]
@@ -257,11 +269,13 @@ def _pseudonym(value):
 
 @dataclass(frozen=True)
 class Scope:
+    """Role dan id pengguna yang sudah divalidasi (dibuat lewat make_scope)."""
     role: str = "company"
     user_id: str | None = None
 
     @property
     def is_restricted(self):
+        """True untuk seller dan customer, yaitu role yang datanya dibatasi."""
         return self.role in ("seller", "customer")
 
 
@@ -269,7 +283,7 @@ class Scope:
 # KONEKSI & SKEMA
 # =============================================================================
 def get_connection():
-    """Koneksi read-only ke olist.db. Error yang jelas kalau database belum dibuat."""
+    """Buka koneksi read-only ke olist.db. Kalau file database belum ada, raise FileNotFoundError."""
     if not DB_PATH.exists():
         raise FileNotFoundError(f"{DB_PATH} not found. Run: python dataset/preprocessing/numeric_data/clean_olist.py")
     return sqlite3.connect(f"file:{DB_PATH.as_posix()}?mode=ro", uri=True)
@@ -277,8 +291,8 @@ def get_connection():
 
 @lru_cache(maxsize=3)
 def get_schema(role="company"):
-    """Teks skema (tabel, kolom, tipe, catatan) untuk prompt LLM. Dibaca sekali lalu di-cache.
-    role "customer" (anonim): hanya tabel umum + view agregat, tabel transaksi tidak disebut."""
+    """Buat teks skema (tabel, kolom, tipe, catatan kolom, dan view) untuk prompt LLM; hasilnya di-cache per role.
+    Untuk role "customer" (anonim) hanya tabel umum + view agregat yang ditampilkan; tabel transaksi tidak disebut."""
     public_only = role == "customer"
     conn = get_connection()
     try:
@@ -303,8 +317,11 @@ def get_schema(role="company"):
 # SCOPE PER ROLE
 # =============================================================================
 def make_scope(role="company", user_id=None):
-    """Validasi role + id. Seller WAJIB punya id yang valid dan ada di database.
-    Customer = pembeli anonim: id tidak dipakai (diabaikan kalau dikirim), scope-nya sama untuk semua."""
+    """Validasi role dan id, lalu kembalikan Scope.
+    - company : tidak butuh id.
+    - customer: pembeli anonim; id diabaikan kalau dikirim, jadi scope-nya sama untuk semua customer.
+    - seller  : WAJIB punya id yang formatnya valid dan ada di tabel sellers.
+    Raise ValueError kalau role atau id tidak valid."""
     role = (role or "company").strip().lower()
     if role not in ROLES:
         raise ValueError(f"Unknown role {role!r}; use one of {ROLES}.")
@@ -315,7 +332,7 @@ def make_scope(role="company", user_id=None):
     user_id = (user_id or "").strip().lower()
     if not user_id:
         raise ValueError(f"A {role} id is required for the {role} role.")
-    if not ID_PATTERN.fullmatch(user_id):      # dicek dulu sebelum id masuk ke teks SQL view
+    if not ID_PATTERN.fullmatch(user_id):      # cek format dulu, karena id ini nanti ditulis langsung ke teks SQL view
         raise ValueError(f"Invalid {role} id: {user_id!r}")
     conn = get_connection()
     try:
@@ -328,8 +345,10 @@ def make_scope(role="company", user_id=None):
 
 
 def _scope_views(scope):
-    """CREATE TEMP VIEW untuk scope. Id sudah lolos ID_PATTERN (hanya hex), jadi aman ditulis ke teks SQL.
-    Customer anonim tidak mendapat view transaksi: authorizer menolak tabel itu, hanya PUBLIC_VIEWS yang terbaca."""
+    """Buat daftar perintah CREATE TEMP VIEW untuk scope seller.
+    Id sudah lolos ID_PATTERN (hanya karakter hex), jadi aman ditulis langsung ke teks SQL.
+    Role lain mendapat list kosong: company membaca tabel asli, sedangkan customer tidak mendapat view transaksi
+    (authorizer menolak tabel itu, jadi yang terbaca hanya tabel umum dan CUSTOMER_VIEWS)."""
     uid = scope.user_id
     if scope.role == "seller":
         own_orders = f"SELECT order_id FROM main.order_items WHERE seller_id = '{uid}'"
@@ -338,6 +357,7 @@ def _scope_views(scope):
                       "ROUND(SUM(freight_value), 2) AS freight_total, COUNT(*) AS n_items, "
                       "ROUND(SUM(price) + SUM(freight_value), 2) AS order_total "
                       f"FROM main.order_items WHERE seller_id = '{uid}' GROUP BY order_id")
+        # kolom orders tanpa kolom uang (diganti versi seller di atas); customer_id diganti pseudonim
         order_cols = ", ".join("pseudonym(o.customer_id) AS customer_id" if c == "customer_id" else f"o.{c}"
                                for c in _order_columns() if c not in ORDER_MONEY_COLUMNS)
         return [
@@ -351,7 +371,7 @@ def _scope_views(scope):
             f"FROM main.order_payments p JOIN ({own_totals}) t ON t.order_id = p.order_id "
             "JOIN main.orders o ON o.order_id = p.order_id",
             f"CREATE TEMP VIEW order_reviews AS SELECT * FROM main.order_reviews WHERE order_id IN ({own_orders})",
-            # Pembeli tanpa id asli dan tanpa kode pos (aturan S3); kota & state tetap untuk agregat
+            # Pembeli tanpa id asli dan tanpa kode pos; kota & state tetap ada untuk agregat
             "CREATE TEMP VIEW customers AS SELECT pseudonym(customer_id) AS customer_id, "
             "pseudonym(customer_unique_id) AS customer_unique_id, customer_city, customer_state "
             "FROM main.customers WHERE customer_id IN "
@@ -360,12 +380,13 @@ def _scope_views(scope):
     return []
 
 
+# Kolom uang di tabel orders yang dihitung ulang khusus untuk seller
 ORDER_MONEY_COLUMNS = ("items_value", "freight_total", "n_items", "order_total")
 
 
 @lru_cache(maxsize=1)
 def _order_columns():
-    """Nama kolom tabel orders (untuk membangun view seller)."""
+    """Ambil nama kolom tabel orders (dipakai untuk membangun view orders seller); hasilnya di-cache."""
     conn = get_connection()
     try:
         return tuple(row[1] for row in conn.execute("PRAGMA table_info(orders)"))
@@ -374,21 +395,22 @@ def _order_columns():
 
 
 def _authorizer(scope, temp_names=frozenset()):
-    """Hanya izinkan membaca. Untuk seller/customer: tabel main hanya boleh dibaca lewat view scope.
+    """Buat fungsi authorizer SQLite yang hanya mengizinkan aksi membaca.
+    Untuk seller/customer, tabel asli (main) hanya boleh dibaca lewat view scope, kecuali PUBLIC_TABLES.
     temp_names = nama TEMP VIEW yang dibuat untuk koneksi ini (boleh dibaca)."""
     def check(action, arg1, arg2, db_name, source):
         if action in (sqlite3.SQLITE_SELECT, sqlite3.SQLITE_FUNCTION, sqlite3.SQLITE_RECURSIVE):
             return sqlite3.SQLITE_OK
         if action == sqlite3.SQLITE_READ:
-            if arg1 and arg1.lower().startswith("sqlite_"):
+            if arg1 and arg1.lower().startswith("sqlite_"):      # tabel internal SQLite (sqlite_master, dst.)
                 return sqlite3.SQLITE_DENY
             if scope.is_restricted and source is None and arg1 not in PUBLIC_TABLES:
-                # baca tabel asli langsung = mencoba melewati scope. COUNT(*) tanpa kolom dilaporkan SQLite
-                # dengan db_name None (bukan "main"), jadi itu juga dicek terhadap daftar view temp.
+                # Membaca tabel asli secara langsung = mencoba melewati scope. COUNT(*) tanpa kolom dilaporkan
+                # SQLite dengan db_name None (bukan "main"), jadi kasus itu juga dicek terhadap daftar view temp.
                 if db_name == "main" or (db_name is None and arg1 not in temp_names):
                     return sqlite3.SQLITE_DENY
             return sqlite3.SQLITE_OK
-        return sqlite3.SQLITE_DENY               # PRAGMA, ATTACH, tulis, buat objek, dst.
+        return sqlite3.SQLITE_DENY               # aksi selain membaca: PRAGMA, ATTACH, menulis, membuat objek, dst.
     return check
 
 
@@ -396,14 +418,16 @@ def _authorizer(scope, temp_names=frozenset()):
 # VALIDASI & EKSEKUSI
 # =============================================================================
 def _strip_literals(sql):
-    """Ganti isi string '...' dan komentar dengan spasi supaya cek kata kunci tidak salah tangkap."""
+    """Kosongkan isi string '...' dan buang komentar SQL, supaya pengecekan kata kunci tidak salah tangkap
+    (mis. kata 'DROP' di dalam teks)."""
     sql = re.sub(r"--[^\n]*", " ", sql)
     sql = re.sub(r"/\*.*?\*/", " ", sql, flags=re.DOTALL)
     return re.sub(r"'(?:[^']|'')*'", "''", sql)
 
 
 def validate_query(sql):
-    """Kembalikan SQL yang sudah dibersihkan, atau raise ValueError kalau tidak boleh dijalankan."""
+    """Periksa SQL dari LLM. Kembalikan SQL yang sudah dirapikan (tanpa ';' di akhir),
+    atau raise ValueError kalau SQL tidak boleh dijalankan."""
     if not sql or not sql.strip():
         raise ValueError("Empty query.")
     sql = sql.strip().rstrip(";").strip()
@@ -419,18 +443,23 @@ def validate_query(sql):
 
 
 def run_query(sql, scope=None, max_rows=MAX_ROWS, timeout=QUERY_TIMEOUT_S):
-    """Jalankan SQL dari LLM dengan semua lapisan keamanan. Raise error kalau ditolak/gagal."""
+    """Jalankan SQL dari LLM dengan semua lapisan keamanan dan kembalikan hasilnya sebagai DataFrame.
+    Urutan: validasi SQL -> koneksi read-only -> buat TEMP VIEW sesuai role -> pasang authorizer dan batas waktu
+    -> jalankan query dan ambil maksimal max_rows baris.
+    Raise error kalau SQL ditolak, gagal, atau melewati batas waktu."""
     sql = validate_query(sql)
     scope = scope or Scope("company")
     conn = get_connection()
     try:
         conn.setlimit(sqlite3.SQLITE_LIMIT_LENGTH, MAX_VALUE_BYTES)   # cegah zeroblob/teks raksasa di memori
         conn.create_function("pseudonym", 1, _pseudonym, deterministic=True)
-        view_sqls = _scope_views(scope) + VIEWS[scope.role]
+        view_sqls = _scope_views(scope) + VIEWS[scope.role]      # view scope seller + view agregat sesuai role
         for view_sql in view_sqls:
             conn.execute(view_sql)
+        # nama semua view temp, supaya authorizer tahu view mana yang boleh dibaca
         temp_names = frozenset(re.search(r"CREATE TEMP VIEW (\w+)", v).group(1) for v in view_sqls)
         conn.set_authorizer(_authorizer(scope, temp_names))
+        # progress handler dipanggil berkala; nilai 1 = hentikan query karena melewati deadline
         deadline = time.monotonic() + timeout
         conn.set_progress_handler(lambda: int(time.monotonic() > deadline), 10_000)
         try:
@@ -463,5 +492,6 @@ ORDER BY o.purchase_month
 
 
 def get_monthly_revenue(role="company", user_id=None):
-    """Pendapatan bulanan (order delivered, 2017-01..2018-08), sudah dibatasi sesuai role."""
+    """Pendapatan bulanan (order delivered, 2017-01..2018-08), sudah dibatasi sesuai role.
+    Kolom hasil: month, revenue, orders."""
     return run_query(MONTHLY_REVENUE_SQL, scope=make_scope(role, user_id), max_rows=1000)

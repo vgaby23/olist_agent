@@ -1,9 +1,17 @@
+"""
+explore_db.py - Script eksplorasi singkat untuk melihat isi olist.db.
+
+Menampilkan 4 ringkasan: daftar tabel, jumlah order per status, rata-rata skor review,
+dan top 5 kategori produk berdasarkan pendapatan (order delivered).
+Database dibuka dari path relatif ./dataset/olist.db.
+"""
 import sqlite3
 import pandas as pd
 
-conn = sqlite3.connect("data/olist.db")
+conn = sqlite3.connect("./dataset/olist.db")
 
 def run(title, query):
+    """Cetak judul, lalu hasil query sebagai tabel."""
     print(f"\n=== {title} ===")
     print(pd.read_sql_query(query, conn).to_string(index=False))
 
