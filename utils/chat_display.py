@@ -2,10 +2,10 @@ import re
 
 import streamlit as st
 import altair as alt
-from agent import supervisor_agent
-from langchain_core.messages import AIMessage
-from utils.chat_config import HIDDEN_COLUMNS, MAX_TABLES, STARTER_QUESTIONS, TIME_COLUMN
+from utils.chat_config import STARTER_QUESTIONS, TIME_COLUMN
 from utils.chat_history import ask_chip
+from utils.chat_text import clean_answer
+from utils.chat_results import latest_versions
 
 
 UNESCAPED_DOLLAR = re.compile(r"(?<!\\)\$")
@@ -14,27 +14,6 @@ UNESCAPED_DOLLAR = re.compile(r"(?<!\\)\$")
 def markdown_safe(text):
     """Escape $ so Streamlit does not render the text between two prices ("R$13,237 ... R$13,169") as LaTeX math."""
     return UNESCAPED_DOLLAR.sub(r"\\$", text or "")
-
-
-def latest_versions(tables):
-    """The data agent can be asked twice or retry a query: of tables with the same columns, keep only the last."""
-    return [table for number, table in enumerate(tables)
-            if not any(list(later.columns) == list(table.columns) for later in tables[number + 1:])]
-
-
-def answer_tables(results, role):
-    """Non-empty SQL results behind an answer, without customer-identifying columns for non-company roles."""
-    tables = []
-    for result in results:
-        data = result.get("data")
-        if data is None or data.empty:
-            continue
-        if role != "company":
-            data = data[[column for column in data.columns if not HIDDEN_COLUMNS.search(str(column))]]
-        if len(data.columns):
-            tables.append(data.reset_index(drop=True))
-    return latest_versions(tables)[-MAX_TABLES:]
-
 
 
 def make_chart(data):
@@ -89,7 +68,7 @@ def show_token_usage(message):
 
 def show_refusal(message, role, key, latest):
     """A refused request (agent/policy.py) as a notice, with allowed questions to try on the latest turn."""
-    st.info(markdown_safe(supervisor_agent.clean_answer(message.text)), icon="🔒")
+    st.info(markdown_safe(clean_answer(message.text)), icon="🔒")
     if latest:
         st.pills("You could ask instead", STARTER_QUESTIONS.get(role, [])[:3], key=f"refusal_chip_{key}",
                  on_change=ask_chip, args=(f"refusal_chip_{key}",))
@@ -109,22 +88,12 @@ def show_answer_details(message):
         st.caption(" · ".join(details))
 
 
-def collect_token_usage(messages):
-    """Sum token usage reported by model messages generated for one answer."""
-    totals = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
-    has_usage = False
-    for message in messages:
-        if not isinstance(message, AIMessage) or not message.usage_metadata:
-            continue
-        usage = message.usage_metadata
-        input_tokens = usage.get("input_tokens", 0)
-        output_tokens = usage.get("output_tokens", 0)
-        totals["input_tokens"] += input_tokens
-        totals["output_tokens"] += output_tokens
-        totals["total_tokens"] += usage.get(
-            "total_tokens", input_tokens + output_tokens
-        )
-        has_usage = True
-    return totals if has_usage else None
-
+def show_message_flow(entries):
+    """Display the delegated specialist messages stored with an answer."""
+    if not entries:
+        return
+    with st.expander("Agent message flow", expanded=False):
+        for entry in entries:
+            st.markdown(f"**{entry['sender']} -> {entry['recipient']}**")
+            st.code(entry["message"], language=None)
 

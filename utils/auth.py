@@ -1,14 +1,11 @@
 import streamlit as st
-import sqlite3
+from utils.api_client import APIRequestError, validate_seller_id
 
 DB = {
 	"customer": {"password": "customer123", "role": "customer"},
     "seller": {"password": "seller123", "role": "seller"}, 
     "company" :{"password": "company123", "role": "company"}
 }
-
-# Seller login dengan seller ID. Customer = pembeli anonim (tanpa ID); aturan apa yang boleh/dilarang
-# per role ada di agent/policy.py.
 
 def verify_login():
     account = st.session_state.get("login_account")
@@ -25,13 +22,10 @@ def verify_login():
             st.error(f"Enter your {role} ID to continue.")
             return
         try:
-            from dataset.preprocessing.numeric_data.sql_tools import make_scope
-
-            scope = make_scope(role, user_id)
-        except (ValueError, OSError, sqlite3.Error) as error:
+            user_id = validate_seller_id(user_id)
+        except APIRequestError as error:
             st.error(f"Could not verify {role} ID: {error}")
             return
-        user_id = scope.user_id
 
     st.session_state["logged_in"] = True
     st.session_state["username"] = account
@@ -96,5 +90,4 @@ def login_page(on_logout=logout):
             st.write(f"Logged in as: **{st.session_state['username']}**")
             if st.session_state.get("agent_id"):
                 st.caption(f"ID: {st.session_state['agent_id']}")
-            # st.write(f"Role: *{st.session_state['role']}*")
             st.button("Logout", on_click=on_logout)

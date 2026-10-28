@@ -4,6 +4,7 @@ import time
 from langchain_core.messages import HumanMessage, AIMessage
 from types import SimpleNamespace
 from utils.auth import logout
+from utils.chat_text import clean_answer
 
 
 MAX_SAVED_CONVERSATIONS = 20
@@ -116,12 +117,12 @@ def ask_chip(key):
         st.session_state["pending_prompt"] = SimpleNamespace(text=question, files=[], audio=None)
 
 
-def chat_transcript(turns, supervisor_agent):
+def chat_transcript(turns):
     """The visible conversation as Markdown, for the download button."""
     parts = []
     for user_message, assistant_message in turns:
         parts.append(f"**You:** {user_message.additional_kwargs.get('display_content', user_message.content)}")
         if assistant_message:
-            parts.append(f"**Assistant:** {supervisor_agent.clean_answer(assistant_message.text)}")
+            parts.append(f"**Assistant:** {clean_answer(assistant_message.text)}")
         parts.append("---")
     return "\n\n".join(parts)

@@ -1,0 +1,11 @@
+.venv
+.git
+.env
+.streamlit/secrets.toml
+.pytest_cache
+__pycache__
+*.pyc
+.agents
+.DS_Store
+test_folder
+dataset/olist.db

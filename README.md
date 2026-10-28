@@ -256,11 +256,30 @@ python -m dataset.preprocessing.vector_data.check_upload
 
 ### Step 6: Start the app
 
+The REST API and Streamlit interface run as separate processes. The API owns the agents
+and database; Streamlit sends each chat turn to it over HTTP. Set `API_URL` in Streamlit
+secrets to the API base URL (`http://localhost:8000` locally).
+
 ```bash
-streamlit run main.py
+uvicorn main:app --host 0.0.0.0 --port "${PORT:-8000}"
 ```
 
-Your browser opens http://localhost:8501. 🎉 Press `Ctrl + C` in the terminal to stop the app.
+In another terminal:
+
+```bash
+streamlit run streamlit_app.py
+```
+
+The interface opens at http://localhost:8501. The API health check is at
+http://localhost:8000/health, and interactive API docs are at http://localhost:8000/docs.
+For Streamlit Community Cloud, use `streamlit_app.py` as the app entry point and configure `API_URL`
+in the app's Secrets settings. The API does not require a bearer token; protect a deployed
+API with platform-level access controls if it should not be publicly accessible.
+Press `Ctrl + C` in each terminal to stop the local processes.
+
+The current role/password login is a demo login, not production authentication. For a
+production launch, replace it with an identity provider and authorization linked to the
+authenticated user.
 
 ---
 
@@ -303,6 +322,7 @@ These tests run **offline**: they don't call OpenAI or Qdrant, so they're free. 
 | Database security (role rules, blocked queries) | `python -m dataset.preprocessing.numeric_data.test_sql_security` |
 | Review search security | `python -m dataset.preprocessing.vector_data.test_rag_security` |
 | Photo and voice input | `python -m pytest test_folder/test_input_preprocessing.py` |
+| API auth, role scope and request validation | `python -m pytest test_folder/test_api.py` |
 
 The security tests need `dataset/olist.db` from step 4.
 
@@ -318,7 +338,13 @@ python -m test_folder.eval_scope_policy
 
 ```
 olist_agent/
-├── main.py                        ← start here: the Streamlit app
+├── streamlit_app.py               ← Streamlit interface entry point
+├── main.py                        FastAPI REST API entry point
+├── interface.py                   Streamlit UI and API request flow
+├── services/
+│   └── chat_service.py            agent orchestration called by the API
+├── schemas/
+│   └── chat.py                    validated chat request and response models
 │
 ├── agent/                         the AI agents
 │   ├── supervisor_agent.py        routes questions, checks the rules
@@ -328,8 +354,9 @@ olist_agent/
 │   ├── category_resolver.py       "make up" → health_beauty
 │   ├── language.py, llm.py        answer language, model settings
 │
-├── utils/                         the chat interface
+├── utils/                         shared helpers and API client
 │   ├── auth.py                    login page
+│   ├── api_client.py              requests the assistant API
 │   ├── chat_config.py             suggestion questions per role
 │   ├── chat_display.py            tables, charts, token usage
 │   ├── chat_history.py            new chat, history, download
@@ -372,17 +399,6 @@ olist_agent/
 - **Products have no names** in the dataset, only an id and a category, so answers talk about categories and product ids.
 - **Data covers 2016–2018.** The analysis uses Jan 2017 – Aug 2018, so "2018" means January–August only.
 - **Customers are anonymous**, so there's no "my order history" for shoppers.
-- **Not in this release:** sales forecasting for sellers and personal recommendations based on purchase history (see the [PRD](docs/PRD.md)).
 - Chat history is kept only while the browser tab is open.
-
----
-
-## 10. Team and dataset
-
-| Area | Person in charge |
-|---|---|
-| Customer features & review search (RAG) | Kemal |
-| Seller features & SQL insights | Firman |
-| Company features & architecture / deployment | Vanessa |
 
 **Dataset:** [Brazilian E-Commerce Public Dataset by Olist](https://www.kaggle.com/datasets/olistbr/brazilian-ecommerce) on Kaggle, licensed CC BY-NC-SA 4.0.
