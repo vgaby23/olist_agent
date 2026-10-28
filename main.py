@@ -151,6 +151,7 @@ async def chat(
         message_flow=result["message_flow"],
         elapsed_seconds=result["elapsed_seconds"],
         token_usage=result["token_usage"],
+        image_context=result.get("image_context"),
     )
 
 

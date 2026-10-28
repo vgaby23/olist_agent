@@ -37,6 +37,8 @@ def process_chat(
     collected_results_token = sql_agent.collected_results.set(sql_results)
     try:
         spoken_text = ""
+        image_context: str | None = None  # NEW
+
         if image is not None or audio is not None:
             with tempfile.TemporaryDirectory() as temp_dir:
                 image_path = None
@@ -57,6 +59,9 @@ def process_chat(
                     text=user_text,
                     image_path=image_path,
                 )
+                # Use the model-facing question as image_context when an image is present
+                if image_path is not None:
+                    image_context = question  # NEW
         else:
             user_text = message.strip()
             question = user_text
@@ -93,6 +98,8 @@ def process_chat(
                 message_details["audio"] = audio
             if spoken_text:
                 message_details["transcript"] = spoken_text
+            if image_context:
+                message_details["image_context"] = image_context  # NEW
 
             supervisor_message = HumanMessage(
                 content=(
@@ -164,6 +171,7 @@ def process_chat(
             "token_usage": token_usage,
             "tables": tables,
             "transcript": spoken_text,
+            "image_context": image_context,  # NEW
         }
     finally:
         sql_agent.collected_results.reset(collected_results_token)
