@@ -372,4 +372,3 @@ def supervisor_agent(role, user_id=None):
 		],
 		prompt=SUPERVISOR_PROMPT + session_prompt,
 	).compile()
-

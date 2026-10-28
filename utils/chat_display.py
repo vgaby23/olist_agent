@@ -109,6 +109,16 @@ def show_answer_details(message):
         st.caption(" · ".join(details))
 
 
+def show_message_flow(entries):
+    """Display the delegated specialist messages stored with an answer."""
+    if not entries:
+        return
+    with st.expander("Agent message flow", expanded=False):
+        for entry in entries:
+            st.markdown(f"**{entry['sender']} -> {entry['recipient']}**")
+            st.code(entry["message"], language=None)
+
+
 def collect_token_usage(messages):
     """Sum token usage reported by model messages generated for one answer."""
     totals = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
@@ -126,5 +136,4 @@ def collect_token_usage(messages):
         )
         has_usage = True
     return totals if has_usage else None
-
 

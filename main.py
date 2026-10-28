@@ -15,6 +15,7 @@ from utils.chat_display import (
     show_answer_details,
     show_refusal,
     show_tables,
+    show_message_flow,
     show_token_usage,
 )
 from utils.chat_history import (
@@ -28,7 +29,7 @@ from utils.chat_history import (
     select_conversation,
     visible_turns,
 )
-from utils.chat_runtime import activity_label
+from utils.chat_runtime import activity_label, handoff_call_ids, message_flow_entries
 from langchain_core.messages import HumanMessage, AIMessage
 
 # Print our own INFO logs (e.g. the voice transcript) in the terminal running streamlit
@@ -125,6 +126,7 @@ for number, (user_message, assistant_message) in enumerate(turns):
                 show_tables(assistant_message.additional_kwargs.get("tables", []), number,
                             collapsed=bool(MARKDOWN_TABLE.search(answer)))
             show_answer_details(assistant_message)
+            show_message_flow(assistant_message.additional_kwargs.get("message_flow", []))
             show_token_usage(assistant_message)
 
 if st.session_state.get("last_error") and not busy:
@@ -178,6 +180,7 @@ if prompt := st.session_state.get("pending_prompt"):
     with st.chat_message("assistant", avatar=AVATARS["assistant"]):
         with st.status("Working on a response...", expanded=True) as activity_status:
             activity_steps = []
+            message_flow = []
             sql_results = []
             token_usage = None
             sql_agent.collected_results.set(sql_results)    # filled by the SQL tool, shown as tables
@@ -243,6 +246,8 @@ if prompt := st.session_state.get("pending_prompt"):
                         },
                     )
                     supervisor_input = [*st.session_state["messages"], supervisor_message]
+                    previous_handoffs = handoff_call_ids(supervisor_input)
+                    seen_handoffs = set(previous_handoffs)
                     final_state = {}
                     for event in supervisor.stream(
                         {"messages": supervisor_input},
@@ -259,6 +264,20 @@ if prompt := st.session_state.get("pending_prompt"):
                             st.write(label)
                             activity_status.update(
                                 label=f"Working on a response... ({time.monotonic() - started:.0f} s)")
+                        for entry in message_flow_entries(event, previous_handoffs):
+                            call_id = entry.get("call_id")
+                            if call_id and call_id in seen_handoffs:
+                                continue
+                            if call_id:
+                                seen_handoffs.add(call_id)
+                            visible_entry = {
+                                key: value for key, value in entry.items() if key != "call_id"
+                            }
+                            message_flow.append(visible_entry)
+                            st.markdown(
+                                f"**{visible_entry['sender']} -> {visible_entry['recipient']}**"
+                            )
+                            st.code(visible_entry["message"], language=None)
 
                     updated_messages = final_state.get("messages", supervisor_input)
                     st.session_state["messages"] = updated_messages
@@ -281,6 +300,7 @@ if prompt := st.session_state.get("pending_prompt"):
 
         if final_answer:
             final_answer.additional_kwargs["activity"] = activity_steps
+            final_answer.additional_kwargs["message_flow"] = message_flow
             final_answer.additional_kwargs["elapsed"] = time.monotonic() - started
             try:
                 final_answer.additional_kwargs["tables"] = answer_tables(sql_results, role)
