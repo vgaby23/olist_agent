@@ -10,6 +10,15 @@ The assistant serves three kinds of users, and each one sees different data:
 | 🏪 | **Seller** (shop owner) | Their own sales, orders, deliveries and reviews, compared with their category |
 | 🏢 | **Company** (Olist staff) | Everything on the platform: revenue, top sellers, top customers, reviews |
 
+**Live demo**
+
+| | URL |
+|---|---|
+| 💬 Chat app (Streamlit Community Cloud) | https://olistagent-bpwariwvzqhf29mqzt4vxc.streamlit.app/ |
+| 🔌 REST API docs (Google Cloud Run) | https://olist-assistant-service-35633518056.us-central1.run.app/docs |
+
+> The API scales to zero when idle, so the first request after a quiet period can take about 30 seconds while it starts.
+
 ---
 
 ## Contents
@@ -19,11 +28,11 @@ The assistant serves three kinds of users, and each one sees different data:
 3. [Who can see what](#3-who-can-see-what)
 4. [Setup guide](#4-setup-guide)
 5. [Using the app](#5-using-the-app)
-6. [Running the tests](#6-running-the-tests)
-7. [Project structure](#7-project-structure)
-8. [Troubleshooting](#8-troubleshooting)
-9. [Limitations](#9-limitations)
-10. [Team and dataset](#10-team-and-dataset)
+6. [REST API](#6-rest-api)
+7. [Running the tests](#7-running-the-tests)
+8. [Project structure](#8-project-structure)
+9. [Troubleshooting](#9-troubleshooting)
+10. [Limitations](#10-limitations)
 
 ---
 
@@ -63,7 +72,8 @@ The app uses three AI **agents**. An agent is a language model (here OpenAI's `g
 
 | Part | Tool |
 |---|---|
-| Web interface | [Streamlit](https://streamlit.io) |
+| Web interface | [Streamlit](https://streamlit.io), hosted on Streamlit Community Cloud |
+| REST API | [FastAPI](https://fastapi.tiangolo.com) in Docker, hosted on Google Cloud Run |
 | Agents | [LangChain](https://www.langchain.com) / LangGraph |
 | Language model and embeddings | OpenAI (`gpt-6-luna`, `text-embedding-3-small`) |
 | Numbers database | SQLite (opened read-only) |
@@ -281,6 +291,19 @@ The current role/password login is a demo login, not production authentication. 
 production launch, replace it with an identity provider and authorization linked to the
 authenticated user.
 
+### Step 7 (optional): Deploy the API to Google Cloud Run
+
+The [`Dockerfile`](Dockerfile) builds `dataset/olist.db` from the raw CSV files during the
+image build, so no database upload is needed. From the project folder:
+
+```bash
+gcloud run deploy olist-assistant-service --source . --region us-central1 --allow-unauthenticated --set-env-vars OPENAI_API_KEY=...,QDRANT_URL=...,QDRANT_API_KEY=...
+```
+
+For anything beyond a demo, store the keys in Secret Manager and pass them with `--set-secrets`
+instead of `--set-env-vars`. Then set `API_URL` in the Streamlit app's Secrets to the service URL
+that the command prints.
+
 ---
 
 ## 5. Using the app
@@ -313,7 +336,39 @@ An answer usually takes **20–40 seconds**, because the agents may run several 
 
 ---
 
-## 6. Running the tests
+## 6. REST API
+
+Streamlit is only a client: all agent work happens in the FastAPI service ([`main.py`](main.py)).
+Requests are `multipart/form-data`, so text, a photo and a voice message can be sent together.
+Full interactive docs are at `/docs`.
+
+| Method | Path | What it does |
+|---|---|---|
+| `GET` | `/health` | Returns `{"status": "ok"}` |
+| `POST` | `/v1/seller/validate` | Checks a `seller_id` exists. `403` if unknown. |
+| `POST` | `/v1/chat` | Runs one assistant turn |
+
+`/v1/chat` form fields:
+
+| Field | Required | Notes |
+|---|---|---|
+| `role` | ✅ | `customer`, `seller` or `company` |
+| `message` | one of message/image/audio | Up to 4,000 characters |
+| `user_id` | sellers only | Must be empty for other roles |
+| `history` | | JSON list of up to 20 alternating `{"role": "user" \| "assistant", "content": "..."}` messages |
+| `image` | | `.jpg`, `.jpeg`, `.png`, `.webp`, `.gif`, up to 20 MB |
+| `audio` | | `.mp3`, `.mp4`, `.m4a`, `.wav`, `.webm`, `.mpeg`, `.mpga`, `.ogg`, `.flac`, up to 20 MB |
+
+The response holds `answer`, `refused` (true when a role rule blocked the question), `tables`,
+`transcript`, `image_context`, `activity`, `message_flow`, `elapsed_seconds` and `token_usage`.
+
+```bash
+curl -X POST https://olist-assistant-service-35633518056.us-central1.run.app/v1/chat -F role=customer -F "message=What are the 5 best-rated sellers for health & beauty?"
+```
+
+---
+
+## 7. Running the tests
 
 These tests run **offline**: they don't call OpenAI or Qdrant, so they're free. They check that the role rules hold in code.
 
@@ -321,8 +376,7 @@ These tests run **offline**: they don't call OpenAI or Qdrant, so they're free. 
 |---|---|
 | Database security (role rules, blocked queries) | `python -m dataset.preprocessing.numeric_data.test_sql_security` |
 | Review search security | `python -m dataset.preprocessing.vector_data.test_rag_security` |
-| Photo and voice input | `python -m pytest test_folder/test_input_preprocessing.py` |
-| API auth, role scope and request validation | `python -m pytest test_folder/test_api.py` |
+| API, API client, chat service and photo/voice input | `python -m pytest test_folder` |
 
 The security tests need `dataset/olist.db` from step 4.
 
@@ -334,7 +388,7 @@ python -m test_folder.eval_scope_policy
 
 ---
 
-## 7. Project structure
+## 8. Project structure
 
 ```
 olist_agent/
@@ -360,7 +414,9 @@ olist_agent/
 │   ├── chat_config.py             suggestion questions per role
 │   ├── chat_display.py            tables, charts, token usage
 │   ├── chat_history.py            new chat, history, download
+│   ├── chat_results.py            tables and token counts from agent runs
 │   ├── chat_runtime.py            "agent is thinking…" labels
+│   ├── chat_text.py               answer text clean-up
 │   ├── input_preprocessing.py     photo → category, voice → text
 │   └── categories.json            list of product categories
 │
@@ -370,15 +426,15 @@ olist_agent/
 │       ├── numeric_data/          build olist.db + safe query tools
 │       └── vector_data/           upload reviews to Qdrant + search
 │
-├── conn/connection.py             connection settings
-├── test_folder/                   evaluation and tuning scripts
+├── test_folder/                   tests, evaluation and tuning scripts
+├── Dockerfile                     API container image for Cloud Run
 ├── requirements.txt               Python packages
 └── .env.example                   template for your API keys
 ```
 
 ---
 
-## 8. Troubleshooting
+## 9. Troubleshooting
 
 | Problem | Fix |
 |---|---|
@@ -391,10 +447,11 @@ olist_agent/
 | `Enter your seller ID to continue` | Sellers can't log in without a Seller ID. Fill it in, or click **"Use sample seller ID"**. |
 | A voice message is transcribed in the wrong language | Set `STT_LANGUAGE` in `.env` to your language code, for example `en` or `id`, then restart the app. |
 | An answer takes a long time | Normal. Complex questions can take up to a minute. |
+| `Could not connect to the assistant API` or a timeout | Check `API_URL` (Streamlit Secrets or `.env`) and open `<API_URL>/health`. The first call after the API has been idle can take about 30 seconds. |
 
 ---
 
-## 9. Limitations
+## 10. Limitations
 
 - **Products have no names** in the dataset, only an id and a category, so answers talk about categories and product ids.
 - **Data covers 2016–2018.** The analysis uses Jan 2017 – Aug 2018, so "2018" means January–August only.
