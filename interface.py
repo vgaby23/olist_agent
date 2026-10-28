@@ -153,12 +153,23 @@ def _api_history(messages):
     for user_message, assistant_message in visible_turns(messages):
         if assistant_message is None:
             continue
-        user_content = user_message.additional_kwargs.get(
+
+        display_content = user_message.additional_kwargs.get(
             "display_content", user_message.content
         )
         transcript = user_message.additional_kwargs.get("transcript")
+        image_context = user_message.additional_kwargs.get("image_context")
+
+        parts = []
+        if image_context:
+            parts.append(image_context)
+        if display_content:
+            parts.append(display_content)
         if transcript:
-            user_content = " ".join(part for part in (user_content, transcript) if part)
+            parts.append(transcript)
+
+        user_content = " ".join(parts).strip()
+
         history.extend(
             [
                 {"role": "user", "content": user_content or "Image/audio question"},
@@ -166,6 +177,8 @@ def _api_history(messages):
             ]
         )
     return history[-20:]
+
+
 
 
 def handle_pending_prompt(prompt, role: str):
@@ -218,6 +231,8 @@ def handle_pending_prompt(prompt, role: str):
                 user_kwargs["audio"] = audio.getvalue()
             if result.get("transcript"):
                 user_kwargs["transcript"] = result["transcript"]
+            if result.get("image_context"):
+                user_kwargs["image_context"] = result["image_context"]
             user_message = HumanMessage(content=prompt_text, additional_kwargs=user_kwargs)
 
             tables = [

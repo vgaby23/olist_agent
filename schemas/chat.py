@@ -10,7 +10,7 @@ class ChatHistoryMessage(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     role: Literal["user", "assistant"]
-    content: str = Field(min_length=1, max_length=12000)
+    content: str = Field(min_length=1)
 
 
 class ChatRequest(BaseModel):
@@ -31,6 +31,7 @@ class ChatResponse(BaseModel):
     message_flow: list[dict]
     elapsed_seconds: float
     token_usage: dict | None = None
+    image_context: str | None = None
 
 class SellerValidateResponse(BaseModel):
     success: bool = True
