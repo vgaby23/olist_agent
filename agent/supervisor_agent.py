@@ -14,6 +14,7 @@ import re
 from dotenv import load_dotenv
 from agent import category_resolver, policy, rag_agent, sql_agent
 from agent.llm import chat_model
+from utils.chat_text import clean_answer
 
 load_dotenv()
 
@@ -255,14 +256,6 @@ Request to evaluate, including any media description:
 	if decision.allowed:
 		decision.violated_rule = ""
 	return decision
-
-
-ANSWER_LANGUAGE_LINE = re.compile(r"^\s*\**ANSWER LANGUAGE:[^\n]*\n*", re.IGNORECASE | re.MULTILINE)
-
-
-def clean_answer(text):
-	"""Remove an echoed 'ANSWER LANGUAGE: ...' instruction line from the final answer before it is shown."""
-	return ANSWER_LANGUAGE_LINE.sub("", text or "").strip()
 
 
 def make_handoff_tool(agent_name, description):
